@@ -1341,6 +1341,18 @@ sub _open_log {
     return $fh;
 }
 
+# Open the log files for one local day: rates-DATE.csv, events-DATE.csv and, when
+# spectrum logging is on, spectrum-DATE.csv. Returns a hashref of filehandles.
+sub _open_day {
+    my ($dir, $day, $spec_on) = @_;
+    my %fh = (
+        rates  => _open_log("$dir/rates-$day.csv",  $MONITOR_HEADER{rates}),
+        events => _open_log("$dir/events-$day.csv", $MONITOR_HEADER{events}),
+    );
+    $fh{spectrum} = _open_log("$dir/spectrum-$day.csv", $MONITOR_HEADER{spectrum}) if $spec_on;
+    return \%fh;
+}
+
 sub _sleep {
     my ($seconds) = @_;
     select(undef, undef, undef, $seconds);
@@ -1360,11 +1372,10 @@ sub monitor {
         return 1;
     }
 
+    my $day = strftime('%Y-%m-%d', localtime);
     my %fh;
     eval {
-        $fh{rates}    = _open_log("$dir/rates.csv",    $MONITOR_HEADER{rates});
-        $fh{events}   = _open_log("$dir/events.csv",   $MONITOR_HEADER{events});
-        $fh{spectrum} = _open_log("$dir/spectrum.csv", $MONITOR_HEADER{spectrum}) if $spec_every;
+        %fh = %{ _open_day($dir, $day, $spec_every) };
         1;
     } or do {
         print STDERR "ERROR: $@";
@@ -1394,6 +1405,13 @@ sub monitor {
         my $next_spec = $session_start;
 
         while (!$MONITOR_STOP) {
+            my $today = strftime('%Y-%m-%d', localtime);
+            if ($today ne $day) {
+                close($_) for values %fh;
+                eval { %fh = %{ _open_day($dir, $today, $spec_every) }; $day = $today; 1 }
+                    or do { print STDERR "monitor: cannot open new log files: $@"; return 1 };
+                print STDERR "monitor: new log files for $today\n";
+            }
             my $raw = $self->data_buf_raw();
             last unless defined $raw;      # link lost or device not answering
 
@@ -1512,6 +1530,16 @@ sub read_csv {
         push @rows, \%r;
     }
     close $fh;
+    return \@rows;
+}
+
+# All daily files of one kind, in date order: rates-*.csv (or a single rates.csv).
+sub read_logs {
+    my ($dir, $kind) = @_;
+    my @rows;
+    for my $file (sort glob("$dir/$kind*.csv")) {
+        push @rows, @{ read_csv($file) };
+    }
     return \@rows;
 }
 
@@ -1678,9 +1706,9 @@ sub plot_spectrum {
 sub run {
     my ($dir) = @_;
     die "no such directory: $dir\n" unless -d $dir;
-    my $rates  = read_csv("$dir/rates.csv");
-    my $events = read_csv("$dir/events.csv");
-    my $spec   = read_csv("$dir/spectrum.csv");
+    my $rates  = read_logs($dir, 'rates');
+    my $events = read_logs($dir, 'events');
+    my $spec   = read_logs($dir, 'spectrum');
     plot_rates($rates, $events, "$dir/rates.svg");
     plot_spectrum($spec, "$dir/spectrum.svg");
     return 0;
@@ -1707,8 +1735,9 @@ Actions (default: live readings):
                   The monitor handles this itself: it logs the reset and rebases.
   --set-time [T]  Write the device clock: 'now' (default) or 'YYYY-MM-DD HH:MM:SS'
                   (local time, sent as-is). Writes to the device.
-  --monitor       Long-running logger: rates.csv, events.csv (alarms and other device
-                  events) and, with --spectrum-every, spectrum.csv (per-interval counts).
+  --monitor       Long-running logger. Each local day gets new files: rates-DATE.csv,
+                  events-DATE.csv (alarms and other device events) and, with
+                  --spectrum-every, spectrum-DATE.csv (per-interval counts).
                   Reconnects after link loss; Ctrl-C stops it.
   --dir DIR       Output directory for --monitor (default: ./radiacode-data)
   --plot [DIR]    Draw DIR/rates.svg and DIR/spectrum.svg from the --monitor logs.
