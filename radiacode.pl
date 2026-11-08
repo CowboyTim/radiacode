@@ -952,7 +952,9 @@ sub init_device {
     defined $self->execute(CMD_SET_EXCHANGE, "\x01\xff\x12\xff") or return 0;
 
     $self->send_clock(time()) or return 0;
-    $self->{base_time} = time() + 128;
+    # The device's record counter starts at zero when it is set, so record time = connect time + ts.
+    # (cdump adds 128 s; on RC-110 fw 4.14/4.15 that put records two minutes in the future.)
+    $self->{base_time} = time();
     $self->{start_time} = time();
 
     my $ver = $self->fw_version();
@@ -1721,8 +1723,16 @@ sub spectrum_delta {
         $fmt //= 0;
         $self->{spec_fmt} = $fmt;
     }
-    my $raw = $self->read_vs(VS_SPECTRUM) or return;
-    my $s = eval { decode_spectrum($raw, $fmt) } or return;
+    my $raw = $self->read_vs(VS_SPECTRUM);
+    unless (defined $raw) {
+        print STDERR "monitor: spectrum read failed at " . strftime('%H:%M:%S', localtime) . "\n";
+        return;
+    }
+    my $s = eval { decode_spectrum($raw, $fmt) };
+    unless ($s) {
+        print STDERR "monitor: spectrum decode failed: " . ($@ || 'malformed') . "\n";
+        return;
+    }
 
     my @c = @{ $s->{counts} };
     my $prev = $self->{prev_spec};
