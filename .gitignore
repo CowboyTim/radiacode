@@ -7,3 +7,5 @@
 /.build/
 __pycache__/
 tools/bench/out/
+# radiacode --monitor default output
+/radiacode-data/

@@ -32,6 +32,9 @@ use Getopt::Long;
 use POSIX qw(strftime);
 use JSON::PP ();
 
+# Command-line entry point. Wrapped in a sub so the file can be required by tests
+# (see the guard at the end of the file).
+sub run_cli {
 my %opts = (
     device            => undef,
     addr_type         => 'public',
@@ -41,6 +44,8 @@ my %opts = (
     notify_uuid       => 'e63215e7-7003-49d8-96b0-b024798fb901',
     interval          => 2,
     count             => 0,
+    dir               => undef,
+    spectrum_every    => 0,
     format            => 'text',
     output            => undef,
     backfill          => 0,
@@ -48,6 +53,7 @@ my %opts = (
 
 my ($do_info, $do_config, $do_buffer, $do_status, $do_spectrum, $do_accum,
     $do_alarms, $do_settings) = (0) x 8;
+my $do_monitor = 0;
 my $set_time;   # undef = not requested; '' or 'now' = host clock; or 'YYYY-MM-DD HH:MM:SS'
 
 GetOptions(
@@ -68,6 +74,9 @@ GetOptions(
     'alarms'            => \$do_alarms,
     'settings'          => \$do_settings,
     'set-time:s'        => \$set_time,
+    'monitor'           => \$do_monitor,
+    'dir=s'             => \$opts{dir},
+    'spectrum-every=f'  => \$opts{spectrum_every},
     'config'            => \$do_config,
     'buffer'            => \$do_buffer,
     'debug|v+'          => \$opts{debug},
@@ -109,7 +118,11 @@ exit $rc_dev->run(
     buffer   => $do_buffer,
     count    => $opts{count},
     interval => $opts{interval},
+    monitor        => $do_monitor,
+    dir            => $opts{dir},
+    spectrum_every => $opts{spectrum_every},
 );
+}
 
 # ============================================================================
 # RadiaCode::BLE class
@@ -170,7 +183,7 @@ use constant {
 # 4-byte little-endian register value]. Templates follow cdump/radiacode _VSFR_FORMATS.
 # These are set in BEGIN blocks because the main program (which calls run()) appears
 # above this package in the file, so plain file-scope assignments would not have run yet.
-my (%STATUS_VSFR, @CSV_COLS);
+my (%STATUS_VSFR, @CSV_COLS, %EVENT_NAME);
 BEGIN {
     %STATUS_VSFR = (
         device_on   => [0x0503, 'V'],       # DEVICE_ON   (value is in the low byte; nonzero = on)
@@ -185,7 +198,28 @@ BEGIN {
 
     # Column order for CSV output.
     @CSV_COLS = qw(time type count count_rate count_rate_err dose_rate dose_rate_err
-                   flags rt_flags duration dose temperature charge_level event event_param1);
+                   flags rt_flags duration dose temperature charge_level event event_name event_param1);
+
+    # Device event ids (cdump EventId). Alarm events are DOSE_RATE_ALARM1/2 (9, 10),
+    # DOSE_ALARM1/2 (12, 13), COUNT_RATE_ALARM1/2 (20, 21) and the OFFSCALE events.
+    %EVENT_NAME = (
+        0 => 'POWER_OFF', 1 => 'POWER_ON', 2 => 'LOW_BATTERY_SHUTDOWN',
+        3 => 'CHANGE_DEVICE_PARAMS', 4 => 'DOSE_RESET', 5 => 'USER_EVENT',
+        6 => 'BATTERY_EMPTY_ALARM', 7 => 'CHARGE_START', 8 => 'CHARGE_STOP',
+        9 => 'DOSE_RATE_ALARM1', 10 => 'DOSE_RATE_ALARM2', 11 => 'DOSE_RATE_OFFSCALE',
+        12 => 'DOSE_ALARM1', 13 => 'DOSE_ALARM2', 14 => 'DOSE_OFFSCALE',
+        15 => 'TEMPERATURE_TOO_LOW', 16 => 'TEMPERATURE_TOO_HIGH', 17 => 'TEXT_MESSAGE',
+        18 => 'MEMORY_SNAPSHOT', 19 => 'SPECTRUM_RESET',
+        20 => 'COUNT_RATE_ALARM1', 21 => 'COUNT_RATE_ALARM2', 22 => 'COUNT_RATE_OFFSCALE',
+    );
+}
+
+# Set by the SIGINT/SIGTERM handler; checked by the monitor loop.
+our $MONITOR_STOP = 0;
+
+sub event_name {
+    my ($id) = @_;
+    return $EVENT_NAME{$id} // "EVENT_$id";
 }
 
 sub new {
@@ -236,26 +270,14 @@ sub run {
 
     print STDERR "Device: $self->{device}\n";
 
-    unless ($self->ble_connect()) {
-        print STDERR "ERROR: BLE connection failed\n";
-        return 1;
+    if ($todo{monitor}) {
+        return $self->monitor(%todo);
     }
+
+    return 1 unless $self->open_session();
 
     my $rc = 1;
     eval {
-        unless ($self->discover_handles()) {
-            print STDERR "ERROR: RadiaCode write/notify characteristics not found\n";
-            die "discover\n";
-        }
-        unless ($self->subscribe_notify()) {
-            print STDERR "ERROR: Could not enable notifications (CCCD)\n";
-            die "cccd\n";
-        }
-        unless ($self->init_device()) {
-            print STDERR "ERROR: Device initialisation failed (is another host connected?)\n";
-            die "init\n";
-        }
-
         $rc = 0;
         if (defined $todo{set_time}) {
             $rc |= $self->print_set_time($todo{set_time});
@@ -299,6 +321,32 @@ sub run {
 # ============================================================================
 # BLE connection (raw L2CAP ATT channel, CID 4)
 # ============================================================================
+
+# Connect, discover handles, enable notifications and initialise the device.
+# Returns true when the device is ready. On failure the link is closed again.
+sub open_session {
+    my ($self) = @_;
+    unless ($self->ble_connect()) {
+        print STDERR "ERROR: BLE connection failed\n";
+        return 0;
+    }
+    unless ($self->discover_handles()) {
+        print STDERR "ERROR: RadiaCode write/notify characteristics not found\n";
+        $self->ble_disconnect();
+        return 0;
+    }
+    unless ($self->subscribe_notify()) {
+        print STDERR "ERROR: Could not enable notifications (CCCD)\n";
+        $self->ble_disconnect();
+        return 0;
+    }
+    unless ($self->init_device()) {
+        print STDERR "ERROR: Device initialisation failed (is another host connected?)\n";
+        $self->ble_disconnect();
+        return 0;
+    }
+    return 1;
+}
 
 sub ble_connect {
     my ($self) = @_;
@@ -739,6 +787,7 @@ sub decode_data_buf {
                     flags => $f[4] };
             } elsif ($gid == 7) {
                 push @out, { type => 'event', time => $t, event => $f[0],
+                    event_name => event_name($f[0]),
                     event_param1 => $f[1], flags => $f[2] };
             }
             # other eid=0 groups: consumed, not reported
@@ -1055,6 +1104,7 @@ sub read_status {
         if (my $rt = $newest->('realtime')) {
             $s{rt_time}       = $rt->{time};
             $s{rt_count_rate} = $rt->{count_rate};
+            $s{rt_count_cpm}  = $rt->{count_rate} * 60;
             $s{rt_dose_rate}  = $rt->{dose_rate};
             # Scale checked against the device display: raw 8.6e-06 shows 0.08 uSv/h,
             # i.e. uSv/h = raw * 1e4 (matches the 10000x factor in cdump's webserver example).
@@ -1093,6 +1143,7 @@ sub print_status {
     # realtime record; register values follow the register names (uR = micro-R).
     my @order = (
         [rt_count_rate => 'Count rate',        sub { sprintf '%.2f cps', $_[0] }],
+        [rt_count_cpm  => 'Count rate',        sub { sprintf '%.0f cpm', $_[0] }],
         [rt_dose_uSv_h => 'Dose rate',         sub { sprintf '%.3f uSv/h', $_[0] }],
         [rt_dose_rate  => 'Dose rate (raw)',   sub { sprintf '%.3g', $_[0] }],
         [dr_uR_h       => 'Dose rate',         sub { "$_[0] uR/h" }],
@@ -1231,8 +1282,155 @@ sub format_record {
     return "$ts  dose_db   count=$r->{count} cps=$r->{count_rate} dose=$r->{dose_rate}" if $t eq 'dose_db';
     return "$ts  rare      duration=$r->{duration}s dose=$r->{dose} temp=$r->{temperature}C charge=$r->{charge_level}%"
         if $t eq 'rare';
-    return "$ts  event     id=$r->{event} param=$r->{event_param1}" if $t eq 'event';
+    return "$ts  event     $r->{event_name} (id=$r->{event}) param=$r->{event_param1}" if $t eq 'event';
     return "$ts  $t";
+}
+
+# ============================================================================
+# Long-running monitor (--monitor)
+# ============================================================================
+
+my %MONITOR_HEADER = (
+    rates    => "time,cps,cpm,cps_err_pct,dose_rate_uSv_h,dose_rate_raw,flags\n",
+    events   => "time,event_id,event_name,param1,flags\n",
+    spectrum => "time,channel,energy_keV,counts\n",
+);
+
+# Append-mode file with a header written only when the file is new or empty.
+sub _open_log {
+    my ($file, $header) = @_;
+    my $new = !(-s $file);
+    open(my $fh, '>>', $file) or die "cannot open $file: $!\n";
+    $fh->autoflush(1);
+    print {$fh} $header if $new;
+    return $fh;
+}
+
+sub _sleep {
+    my ($seconds) = @_;
+    select(undef, undef, undef, $seconds);
+}
+
+# Poll the device for a long time: realtime rates and alarm events go to CSV logs,
+# and optionally the spectrum change over each interval. Survives link loss by
+# reconnecting with backoff. SIGINT/SIGTERM stop it cleanly.
+sub monitor {
+    my ($self, %m) = @_;
+    my $dir        = $m{dir} // './radiacode-data';
+    my $interval   = $m{interval} // 2;
+    my $spec_every = $m{spectrum_every} // 0;
+
+    unless (-d $dir || mkdir($dir)) {
+        print STDERR "ERROR: cannot create $dir: $!\n";
+        return 1;
+    }
+
+    my %fh;
+    eval {
+        $fh{rates}    = _open_log("$dir/rates.csv",    $MONITOR_HEADER{rates});
+        $fh{events}   = _open_log("$dir/events.csv",   $MONITOR_HEADER{events});
+        $fh{spectrum} = _open_log("$dir/spectrum.csv", $MONITOR_HEADER{spectrum}) if $spec_every;
+        1;
+    } or do {
+        print STDERR "ERROR: $@";
+        return 1;
+    };
+
+    local $SIG{INT}  = sub { $RadiaCode::BLE::MONITOR_STOP = 1 };
+    local $SIG{TERM} = sub { $RadiaCode::BLE::MONITOR_STOP = 1 };
+    $MONITOR_STOP = 0;
+
+    print STDERR "monitor: logging to $dir (Ctrl-C to stop)\n";
+    my $backoff = 5;
+    while (!$MONITOR_STOP) {
+        unless ($self->open_session()) {
+            print STDERR "monitor: not connected, retrying in ${backoff}s\n";
+            _sleep($backoff);
+            $backoff = $backoff * 2 > 300 ? 300 : $backoff * 2;
+            next;
+        }
+        $backoff = 5;
+        print STDERR "monitor: connected " . strftime('%Y-%m-%d %H:%M:%S', localtime) . "\n";
+
+        my $session_start = time();
+        $self->{start_time} = $session_start;
+        $self->{seen}      = {};
+        $self->{prev_spec} = undef;
+        my $next_spec = $session_start;
+
+        while (!$MONITOR_STOP) {
+            my $raw = $self->data_buf_raw();
+            last unless defined $raw;      # link lost or device not answering
+
+            for my $r (decode_data_buf($raw, $self->{base_time})) {
+                next if $r->{time} < $session_start;    # history from before this session
+                next if $self->_seen($r);
+                if ($r->{type} eq 'realtime') {
+                    my $cps = $r->{count_rate};
+                    printf {$fh{rates}} "%s,%.3f,%.1f,%.1f,%.6g,%.6g,%d\n",
+                        iso_time($r->{time}), $cps, $cps * 60, $r->{count_rate_err},
+                        $r->{dose_rate} * 1e4, $r->{dose_rate}, $r->{flags};
+                } elsif ($r->{type} eq 'event') {
+                    printf {$fh{events}} "%s,%d,%s,%d,%d\n",
+                        iso_time($r->{time}), $r->{event}, $r->{event_name},
+                        $r->{event_param1}, $r->{flags};
+                }
+            }
+
+            if ($spec_every && time() >= $next_spec) {
+                $self->spectrum_delta($fh{spectrum});
+                $next_spec = time() + $spec_every;
+            }
+            _sleep($interval);
+        }
+
+        $self->ble_disconnect();
+        print STDERR "monitor: link lost, reconnecting\n" if !$MONITOR_STOP;
+    }
+
+    close($_) for values %fh;
+    $self->ble_disconnect();
+    print STDERR "monitor: stopped\n";
+    return 0;
+}
+
+# Read the cumulative spectrum and write the counts added since the previous read,
+# as sparse rows (only channels that changed). A decrease means the device reset its
+# spectrum; the new value becomes the baseline and nothing is written for that read.
+sub spectrum_delta {
+    my ($self, $fh) = @_;
+    my $fmt = $self->{spec_fmt};
+    unless (defined $fmt) {
+        my $cfg = $self->configuration() // '';
+        ($fmt) = $cfg =~ /^SpecFormatVersion\s*=\s*(\d+)/m;
+        $fmt //= 0;
+        $self->{spec_fmt} = $fmt;
+    }
+    my $raw = $self->read_vs(VS_SPECTRUM) or return;
+    my $s = eval { decode_spectrum($raw, $fmt) } or return;
+
+    my @c = @{ $s->{counts} };
+    my $prev = $self->{prev_spec};
+    $self->{prev_spec} = { duration => $s->{duration_s}, counts => \@c };
+    return unless $prev;
+
+    my $reset = $s->{duration_s} < $prev->{duration} || @c != @{ $prev->{counts} };
+    for my $i (0 .. $#c) {
+        last if $reset;
+        $reset = 1 if $c[$i] < $prev->{counts}[$i];
+    }
+    if ($reset) {
+        print STDERR "monitor: spectrum reset detected, new baseline\n";
+        return;
+    }
+
+    my $now = iso_time(time());
+    my ($a0, $a1, $a2) = @{$s}{qw(a0 a1 a2)};
+    for my $i (0 .. $#c) {
+        my $d = $c[$i] - $prev->{counts}[$i];
+        next unless $d > 0;
+        printf {$fh} "%s,%d,%.3f,%d\n", $now, $i, channel_to_keV($i, $a0, $a1, $a2), $d;
+    }
 }
 
 sub debug {
@@ -1259,6 +1457,12 @@ Actions (default: live readings):
   --accum         With --spectrum: read the accumulated spectrum instead
   --set-time [T]  Write the device clock: 'now' (default) or 'YYYY-MM-DD HH:MM:SS'
                   (local time, sent as-is). Writes to the device.
+  --monitor       Long-running logger: rates.csv, events.csv (alarms and other device
+                  events) and, with --spectrum-every, spectrum.csv (per-interval counts).
+                  Reconnects after link loss; Ctrl-C stops it.
+  --dir DIR       Output directory for --monitor (default: ./radiacode-data)
+  --spectrum-every SEC
+                  With --monitor: read the spectrum every SEC seconds and log the change
   --alarms        Show count-rate, dose-rate and dose alarm thresholds (read-only)
   --settings      Show display, sound, vibration and language settings (read-only)
   --config        Dump device configuration (text)
@@ -1291,3 +1495,7 @@ Examples:
   $0 -d 52:43:06:E0:0C:23 --format json --buffer
 EOF
 }
+
+# Run the CLI only when executed as a script, not when required (e.g. by t/).
+run_cli() unless caller;
+1;
