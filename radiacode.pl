@@ -16,11 +16,12 @@
 #   a u32 LEN (of the response, including its 4-byte header), followed by the response.
 #
 # Usage:
-#   ./radiacode.pl -d AA:BB:CC:DD:EE:FF --info
-#   ./radiacode.pl -d AA:BB:CC:DD:EE:FF --config
-#   ./radiacode.pl -d AA:BB:CC:DD:EE:FF                    # live realtime readings (Ctrl-C to stop)
-#   ./radiacode.pl -d AA:BB:CC:DD:EE:FF --interval 5 --count 10
-#   ./radiacode.pl -d AA:BB:CC:DD:EE:FF --buffer           # dump all buffered records once
+#   ./radiacode.pl -d AA:BB:CC:DD:EE:FF --info                 # serial and firmware
+#   ./radiacode.pl -d AA:BB:CC:DD:EE:FF --status               # live status registers
+#   ./radiacode.pl -d AA:BB:CC:DD:EE:FF --config               # device configuration text
+#   ./radiacode.pl -d AA:BB:CC:DD:EE:FF --buffer               # dump buffered records once
+#   ./radiacode.pl -d AA:BB:CC:DD:EE:FF                        # live readings (Ctrl-C to stop)
+#   ./radiacode.pl -d AA:BB:CC:DD:EE:FF -i 5 -n 10 --format csv -o readings.csv
 #
 # NOTE: The RadiaCode must not be connected to another host (e.g. the phone app) at the same time.
 
@@ -29,6 +30,7 @@ use warnings;
 use bytes;
 use Getopt::Long;
 use POSIX qw(strftime);
+use JSON::PP ();
 
 my %opts = (
     device            => undef,
@@ -39,9 +41,12 @@ my %opts = (
     notify_uuid       => 'e63215e7-7003-49d8-96b0-b024798fb901',
     interval          => 2,
     count             => 0,
+    format            => 'text',
+    output            => undef,
+    backfill          => 0,
 );
 
-my ($do_info, $do_config, $do_buffer) = (0, 0, 0);
+my ($do_info, $do_config, $do_buffer, $do_status, $do_spectrum, $do_accum) = (0, 0, 0, 0, 0, 0);
 
 GetOptions(
     'device|d=s'        => \$opts{device},
@@ -51,7 +56,13 @@ GetOptions(
     'notify-uuid=s'     => \$opts{notify_uuid},
     'interval|i=f'      => \$opts{interval},
     'count|n=i'         => \$opts{count},
+    'format|f=s'        => \$opts{format},
+    'output|o=s'        => \$opts{output},
+    'backfill'          => \$opts{backfill},
     'info'              => \$do_info,
+    'status'            => \$do_status,
+    'spectrum'          => \$do_spectrum,
+    'accum'             => \$do_accum,
     'config'            => \$do_config,
     'buffer'            => \$do_buffer,
     'debug|v+'          => \$opts{debug},
@@ -75,13 +86,20 @@ if ($opts{interval} <= 0) {
     print STDERR "Error: --interval must be > 0\n";
     exit 1;
 }
+if ($opts{format} !~ /^(?:text|csv|json)$/) {
+    print STDERR "Error: --format must be text, csv or json\n";
+    exit 1;
+}
 
 my $rc_dev = RadiaCode::BLE->new(%opts);
 exit $rc_dev->run(
-    info   => $do_info,
-    config => $do_config,
-    buffer => $do_buffer,
-    count  => $opts{count},
+    info     => $do_info,
+    status   => $do_status,
+    spectrum => $do_spectrum,
+    accum    => $do_accum,
+    config   => $do_config,
+    buffer   => $do_buffer,
+    count    => $opts{count},
     interval => $opts{interval},
 );
 
@@ -116,24 +134,51 @@ use constant {
     GATT_CCCD_UUID            => 0x2902,
 
     # RadiaCode command IDs (request header u16)
+    CMD_GET_STATUS            => 0x0005,
     CMD_GET_VERSION           => 0x000A,
     CMD_GET_SERIAL            => 0x000B,
     CMD_SET_EXCHANGE          => 0x0007,
     CMD_SET_TIME              => 0x0A04,
     CMD_WR_VIRT_SFR           => 0x0825,
+    CMD_RD_VIRT_SFR_BATCH     => 0x082A,
     CMD_RD_VIRT_STRING        => 0x0826,
 
     # Virtual strings
     VS_CONFIGURATION          => 0x0002,
     VS_SERIAL_NUMBER          => 0x0008,
     VS_DATA_BUF               => 0x0100,
+    VS_SPECTRUM               => 0x0200,
+    VS_SPEC_ACCUM             => 0x0205,
 
     # Virtual SFRs
     VSFR_DEVICE_TIME          => 0x0504,
 
     ATT_CHUNK                 => 18,   # max payload per Write Command, as used by cdump/radiacode
     RESPONSE_TIMEOUT          => 10.0,
+    SEEN_LIMIT                => 20000, # de-dup memory cap for live mode
 };
+
+# Registers read by --status: name => [VSFR id, perl unpack template applied to the
+# 4-byte little-endian register value]. Templates follow cdump/radiacode _VSFR_FORMATS.
+# These are set in BEGIN blocks because the main program (which calls run()) appears
+# above this package in the file, so plain file-scope assignments would not have run yet.
+my (%STATUS_VSFR, @CSV_COLS);
+BEGIN {
+    %STATUS_VSFR = (
+        device_on   => [0x0503, 'x3 C'],    # DEVICE_ON   (3x?)
+        cps         => [0x8020, 'V'],       # CPS         (counts per second)
+        dr_uR_h     => [0x8021, 'V'],       # DR_uR_h     (dose rate, micro-R/h)
+        ds_uR       => [0x8022, 'V'],       # DS_uR       (accumulated dose, micro-R)
+        temp_c      => [0x8024, 'f<'],      # TEMP_degC   (float)
+        acc_x       => [0x8025, 'x2 s<'],   # ACC_X       (int16)
+        acc_y       => [0x8026, 'x2 s<'],   # ACC_Y
+        acc_z       => [0x8027, 'x2 s<'],   # ACC_Z
+    );
+
+    # Column order for CSV output.
+    @CSV_COLS = qw(time type count count_rate count_rate_err dose_rate dose_rate_err
+                   flags rt_flags duration dose temperature charge_level event event_param1);
+}
 
 sub new {
     my ($class, %o) = @_;
@@ -144,8 +189,15 @@ sub new {
         debug           => $o{debug} // 0,
         write_uuid      => lc($o{write_uuid}  // 'e63215e6-7003-49d8-96b0-b024798fb901'),
         notify_uuid     => lc($o{notify_uuid} // 'e63215e7-7003-49d8-96b0-b024798fb901'),
+        format          => $o{format} // 'text',
+        output          => $o{output},
+        backfill        => $o{backfill} // 0,
 
         socket          => undef,
+        out             => \*STDOUT,
+        csv_header_due  => 1,
+        json            => JSON::PP->new->canonical(1),
+        seen            => {},
         h_write         => 0,     # value handle of write characteristic
         h_notify        => 0,     # value handle of notify characteristic
         h_cccd          => 0,     # CCCD handle of notify characteristic
@@ -160,6 +212,19 @@ sub new {
 
 sub run {
     my ($self, %todo) = @_;
+
+    # Output destination for measurement records (status/info/config go to STDOUT).
+    if (defined $self->{output}) {
+        my $file = $self->{output};
+        my $existed_nonempty = (-s $file) ? 1 : 0;
+        open(my $fh, '>>', $file) or do {
+            print STDERR "ERROR: cannot open output file '$file': $!\n";
+            return 1;
+        };
+        $fh->autoflush(1);
+        $self->{out} = $fh;
+        $self->{csv_header_due} = $existed_nonempty ? 0 : 1;
+    }
 
     print STDERR "Device: $self->{device}\n";
 
@@ -187,13 +252,19 @@ sub run {
         if ($todo{info}) {
             $rc |= $self->print_info();
         }
+        if ($todo{status}) {
+            $rc |= $self->print_status();
+        }
+        if ($todo{spectrum}) {
+            $rc |= $self->print_spectrum($todo{accum});
+        }
         if ($todo{config}) {
             $rc |= $self->print_config();
         }
         if ($todo{buffer}) {
             $rc |= $self->print_buffer();
         }
-        if (!$todo{info} && !$todo{config} && !$todo{buffer}) {
+        if (!$todo{info} && !$todo{status} && !$todo{config} && !$todo{buffer} && !$todo{spectrum}) {
             $rc |= $self->live($todo{interval}, $todo{count});
         }
         1;
@@ -203,6 +274,7 @@ sub run {
     };
 
     $self->ble_disconnect();
+    close($self->{out}) if defined $self->{output};
     return $rc;
 }
 
@@ -279,7 +351,7 @@ sub discover_handles {
 
     my $want_w = uuid_le_bytes($self->{write_uuid});
     my $want_n = uuid_le_bytes($self->{notify_uuid});
-    my ($start, $last_decl_start) = (0x0001, 0);
+    my $start = 0x0001;
 
     while ($start <= 0xFFFE) {
         my $rsp = $self->att_request(
@@ -384,7 +456,7 @@ sub subscribe_notify {
 # ============================================================================
 
 # Send one framed command and return the response body (after the 4-byte header
-# echo), or undef on error/timeout.
+# echo), or undef on error/timeout. An empty body is returned as '' (defined).
 sub execute {
     my ($self, $cmd, $args) = @_;
     $args //= '';
@@ -468,6 +540,32 @@ sub write_vsfr {
     return length($r) >= 4 && unpack('V', substr($r, 0, 4)) == 1;
 }
 
+# Batch-read registers. Returns one raw u32 per id, or undef for a register the device
+# reports as invalid (the firmware does not expose every register). Empty list on
+# transport failure. Request: [n][id...]. Response: [valid-bitmask u32][value u32 ...].
+sub read_vsfrs_raw {
+    my ($self, @ids) = @_;
+    my $n = scalar @ids;
+    return () unless $n;
+    my $r = $self->execute(CMD_RD_VIRT_SFR_BATCH, pack('V', $n) . join('', map { pack('V', $_) } @ids))
+        or return ();
+    return () unless length($r) >= 4;
+    my $flags = unpack('V', substr($r, 0, 4));
+    # Values are sent only for the valid registers, in request order.
+    my @vals  = unpack('V*', substr($r, 4));
+    $self->debug(sprintf('batch read: validity mask %0*b for %d ids, %d values',
+        $n, $flags, $n, scalar @vals));
+    my ($out, @res) = (0);
+    for my $i (0 .. $n - 1) {
+        if (($flags >> $i) & 1) {
+            push @res, $vals[$out++];
+        } else {
+            push @res, undef;
+        }
+    }
+    return @res;
+}
+
 # Handshake, time sync and base time (mirrors cdump/radiacode RadiaCode.__init__).
 sub init_device {
     my ($self) = @_;
@@ -481,6 +579,7 @@ sub init_device {
 
     $self->write_vsfr(VSFR_DEVICE_TIME, pack('V', 0)) or return 0;
     $self->{base_time} = time() + 128;
+    $self->{start_time} = time();
 
     my $ver = $self->fw_version();
     if (defined $ver) {
@@ -519,10 +618,17 @@ sub configuration {
     return $self->read_vs(VS_CONFIGURATION);   # CP1251 text, "key=value" lines
 }
 
-# Read and decode the device's buffered record stream (VS DATA_BUF).
 sub data_buf_raw {
     my ($self) = @_;
     return $self->read_vs(VS_DATA_BUF);   # undef on failure
+}
+
+# Device status flags from GET_STATUS (u32), or undef.
+sub status_flags {
+    my ($self) = @_;
+    my $r = $self->execute(CMD_GET_STATUS) or return;
+    return unless length($r) >= 4;
+    return unpack('V', substr($r, 0, 4));
 }
 
 # ============================================================================
@@ -601,8 +707,139 @@ sub decode_data_buf {
 }
 
 # ============================================================================
+# Spectrum decoder (pure function, no I/O)
+# ============================================================================
+
+# Format version 0: plain u32 counts.
+sub decode_counts_v0 {
+    my ($data) = @_;
+    return unpack('V*', $data);
+}
+
+# Format version 1: packed runs. Each u16 header = [count:12][vlen:4]; each sample is
+# stored as a delta from the previous one, with width given by vlen (cdump decoders/spectrum.py).
+sub decode_counts_v1 {
+    my ($data) = @_;
+    my @counts;
+    my ($last, $pos) = (0, 0);
+    my $len = length $data;
+    while ($pos < $len) {
+        die "truncated spectrum header\n" if $pos + 2 > $len;
+        my $u16  = unpack('v', substr($data, $pos, 2));
+        $pos += 2;
+        my $cnt  = ($u16 >> 4) & 0x0FFF;
+        my $vlen = $u16 & 0x0F;
+        for (1 .. $cnt) {
+            my $v;
+            if ($vlen == 0) {
+                $v = 0;
+            } elsif ($vlen == 1) {
+                die "truncated spectrum\n" if $pos + 1 > $len;
+                $v = unpack('C', substr($data, $pos, 1)); $pos += 1;
+            } elsif ($vlen == 2) {
+                die "truncated spectrum\n" if $pos + 1 > $len;
+                $v = $last + unpack('c', substr($data, $pos, 1)); $pos += 1;
+            } elsif ($vlen == 3) {
+                die "truncated spectrum\n" if $pos + 2 > $len;
+                $v = $last + unpack('s<', substr($data, $pos, 2)); $pos += 2;
+            } elsif ($vlen == 4) {
+                die "truncated spectrum\n" if $pos + 3 > $len;
+                my ($a, $b, $c) = unpack('CCc', substr($data, $pos, 3)); $pos += 3;
+                $v = $last + $c * 65536 + $b * 256 + $a;   # c is signed
+            } elsif ($vlen == 5) {
+                die "truncated spectrum\n" if $pos + 4 > $len;
+                $v = $last + unpack('l<', substr($data, $pos, 4)); $pos += 4;
+            } else {
+                die "unsupported spectrum vlen=$vlen\n";
+            }
+            $last = $v;
+            push @counts, $v;
+        }
+    }
+    return @counts;
+}
+
+# Decode a VS SPECTRUM/SPEC_ACCUM blob: [duration u32 s][a0 f][a1 f][a2 f][counts...]
+# Returns a hashref, or undef on a malformed blob.
+sub decode_spectrum {
+    my ($data, $format_version) = @_;
+    return undef if length($data) < 16;
+    my ($duration, $a0, $a1, $a2) = unpack('V f< f< f<', substr($data, 0, 16));
+    my $body = substr($data, 16);
+    my @counts = $format_version == 0 ? decode_counts_v0($body) : decode_counts_v1($body);
+    return { duration_s => $duration, a0 => $a0, a1 => $a1, a2 => $a2, counts => \@counts };
+}
+
+# Quadratic channel-to-energy calibration (keV), as in cdump spectrum_channel_to_energy.
+sub channel_to_keV {
+    my ($ch, $a0, $a1, $a2) = @_;
+    return $a0 + $a1 * $ch + $a2 * $ch * $ch;
+}
+
+# ============================================================================
 # Commands
 # ============================================================================
+
+# Read and print the current (or accumulated) energy spectrum.
+sub print_spectrum {
+    my ($self, $accum) = @_;
+    my $id = $accum ? VS_SPEC_ACCUM : VS_SPECTRUM;
+
+    my $cfg = $self->configuration() // '';
+    my ($fmt) = $cfg =~ /^SpecFormatVersion\s*=\s*(\d+)/m;
+    $fmt //= 0;
+    unless ($fmt == 0 || $fmt == 1) {
+        print STDERR "ERROR: unsupported spectrum format version $fmt\n";
+        return 1;
+    }
+
+    my $raw = $self->read_vs($id);
+    unless (defined $raw) {
+        print STDERR "ERROR: could not read spectrum\n";
+        return 1;
+    }
+    my $s = eval { decode_spectrum($raw, $fmt) };
+    unless ($s) {
+        print STDERR "ERROR: could not decode spectrum: " . ($@ || 'malformed data') . "\n";
+        return 1;
+    }
+
+    my @c = @{ $s->{counts} };
+    my ($a0, $a1, $a2) = @{$s}{qw(a0 a1 a2)};
+    my $total = 0; $total += $_ for @c;
+    my ($peak_ch, $peak) = (0, -1);
+    for my $i (0 .. $#c) { ($peak_ch, $peak) = ($i, $c[$i]) if $c[$i] > $peak; }
+
+    my $fh = $self->{out};
+    if ($self->{format} eq 'json') {
+        my %j = (
+            spectrum      => $accum ? 'accumulated' : 'current',
+            format_version => $fmt,
+            duration_s    => $s->{duration_s},
+            calibration   => { a0 => $a0, a1 => $a1, a2 => $a2 },
+            channels      => scalar(@c),
+            total_counts  => $total,
+            counts        => \@c,
+        );
+        print {$fh} $self->{json}->encode(\%j), "\n";
+    } elsif ($self->{format} eq 'csv') {
+        print {$fh} "channel,energy_keV,counts\n";
+        for my $i (0 .. $#c) {
+            printf {$fh} "%d,%.3f,%d\n", $i, channel_to_keV($i, $a0, $a1, $a2), $c[$i];
+        }
+    } else {
+        printf "Spectrum:       %s (format v%d)\n", $accum ? 'accumulated' : 'current', $fmt;
+        printf "Duration:       %d s\n", $s->{duration_s};
+        printf "Calibration:    a0=%.4f a1=%.6f a2=%.9f\n", $a0, $a1, $a2;
+        printf "Channels:       %d\n", scalar @c;
+        printf "Total counts:   %d\n", $total;
+        if (@c) {
+            printf "Peak:           channel %d (%.1f keV), %d counts\n",
+                $peak_ch, channel_to_keV($peak_ch, $a0, $a1, $a2), $peak;
+        }
+    }
+    return 0;
+}
 
 sub print_info {
     my ($self) = @_;
@@ -615,6 +852,92 @@ sub print_info {
     } else {
         print STDERR "ERROR: could not read firmware version\n";
         return 1;
+    }
+    return 0;
+}
+
+# Phase 1: one snapshot of the status registers plus the latest RareData record.
+sub read_status {
+    my ($self) = @_;
+    my %s;
+
+    my $flags = $self->status_flags();
+    $s{status_flags} = $flags if defined $flags;
+
+    my @names = sort keys %STATUS_VSFR;
+    my @raw = $self->read_vsfrs_raw(map { $STATUS_VSFR{$_}[0] } @names);
+    for my $i (0 .. $#names) {
+        next unless defined $raw[$i];          # register not exposed by this firmware
+        my $tmpl = $STATUS_VSFR{$names[$i]}[1];
+        $s{$names[$i]} = (unpack($tmpl, pack('V', $raw[$i])))[0];
+    }
+
+    # Count rate, dose rate, battery/charge and duration come from the buffered records.
+    # The firmware does not expose CPS/DR/DS registers, so the latest realtime record
+    # is the source for count and dose rate.
+    my $raw_buf = $self->data_buf_raw();
+    if (defined $raw_buf) {
+        my @recs = decode_data_buf($raw_buf, $self->{base_time});
+        # The buffer is not in time order, so pick the newest record by timestamp.
+        my $newest = sub {
+            my $type = shift;
+            my ($r) = sort { $b->{time} <=> $a->{time} } grep { $_->{type} eq $type } @recs;
+            return $r;
+        };
+        if (my $rt = $newest->('realtime')) {
+            $s{rt_time}       = $rt->{time};
+            $s{rt_count_rate} = $rt->{count_rate};
+            $s{rt_dose_rate}  = $rt->{dose_rate};
+            # Scale checked against the device display: raw 8.6e-06 shows 0.08 uSv/h,
+            # i.e. uSv/h = raw * 1e4 (matches the 10000x factor in cdump's webserver example).
+            $s{rt_dose_uSv_h} = $rt->{dose_rate} * 1e4;
+        }
+        if (my $rare = $newest->('rare')) {
+            $s{charge_level}    = $rare->{charge_level};
+            $s{rare_temp_c}     = $rare->{temperature};
+            $s{rare_duration_s} = $rare->{duration};
+            $s{rare_dose}       = $rare->{dose};
+            # Accumulated dose: raw * 1e4 = uSv (matches the device display: 0.0270 raw -> 270 uSv).
+            $s{dose_uSv}        = $rare->{dose} * 1e4;
+        }
+    }
+    return \%s;
+}
+
+sub print_status {
+    my ($self) = @_;
+    my $s = $self->read_status();
+    unless (keys %$s) {
+        print STDERR "ERROR: could not read status registers\n";
+        return 1;
+    }
+
+    if ($self->{format} eq 'json') {
+        print {$self->{out}} $self->{json}->encode($s), "\n";
+        return 0;
+    }
+
+    # Display order and labels. Units: rt_* values are the raw device scale from the
+    # realtime record; register values follow the register names (uR = micro-R).
+    my @order = (
+        [rt_count_rate => 'Count rate',        sub { sprintf '%.2f cps', $_[0] }],
+        [rt_dose_uSv_h => 'Dose rate',         sub { sprintf '%.3f uSv/h', $_[0] }],
+        [rt_dose_rate  => 'Dose rate (raw)',   sub { sprintf '%.3g', $_[0] }],
+        [dr_uR_h       => 'Dose rate',         sub { "$_[0] uR/h" }],
+        [ds_uR         => 'Accumulated dose',  sub { "$_[0] uR" }],
+        [temp_c        => 'Temperature',       sub { sprintf '%.1f C', $_[0] }],
+        [charge_level  => 'Charge level',      sub { sprintf '%.1f %%', $_[0] }],
+        [device_on     => 'Device on',         sub { $_[0] ? 'yes' : 'no' }],
+        [status_flags  => 'Status flags',      sub { sprintf '0x%08X', $_[0] }],
+        [rare_duration_s => 'Measure time',    sub { "$_[0] s" }],
+        [rare_temp_c   => 'Temperature (rare)', sub { sprintf '%.1f C', $_[0] }],
+        [dose_uSv      => 'Accumulated dose',  sub { sprintf '%.0f uSv', $_[0] }],
+        [rare_dose     => 'Accumulated (raw)', sub { sprintf '%.4g', $_[0] }],
+    );
+    for my $row (@order) {
+        my ($k, $name, $fmt) = @$row;
+        next unless exists $s->{$k};
+        printf "%-20s %s\n", "$name:", $fmt->($s->{$k});
     }
     return 0;
 }
@@ -640,39 +963,90 @@ sub print_buffer {
     }
     my @recs = decode_data_buf($raw, $self->{base_time});
     unless (@recs) {
-        print "(no records)\n";
+        print {$self->{out}} "(no records)\n" if $self->{format} eq 'text';
         return 0;
     }
-    for my $r (@recs) {
-        print format_record($r), "\n";
-    }
+    $self->emit($_) for @recs;
     return 0;
 }
 
-# Poll the buffer and print realtime readings. count=0 means run until interrupted.
+# Poll the buffer and emit new records (duplicates across polls are dropped).
+# count=0 means run until interrupted.
 sub live {
     my ($self, $interval, $count) = @_;
-    my $printed = 0;
-    print "time                 cps        dose_rate(raw)  cps_err%  dose_err%\n";
+    my $emitted = 0;
     while (1) {
         my $raw = $self->data_buf_raw();
         unless (defined $raw) {
             print STDERR "ERROR: could not read data buffer\n";
             return 1;
         }
-        my @recs = grep { $_->{type} eq 'realtime' } decode_data_buf($raw, $self->{base_time});
-        for my $r (@recs) {
-            printf "%-20s %-10.2f %-15.4f %-9.1f %.1f\n",
-                strftime('%Y-%m-%d %H:%M:%S', localtime($r->{time})),
-                $r->{count_rate}, $r->{dose_rate},
-                $r->{count_rate_err}, $r->{dose_rate_err};
-            $printed++;
-            last if $count && $printed >= $count;
+        for my $r (decode_data_buf($raw, $self->{base_time})) {
+            # Without --backfill, skip records dated before this session started (the device
+            # buffer holds older history, including records with its own earlier clock).
+            next if !$self->{backfill} && $r->{time} < $self->{start_time};
+            next if $self->_seen($r);
+            $self->emit($r);
+            $emitted++;
+            last if $count && $emitted >= $count;
         }
-        last if $count && $printed >= $count;
+        last if $count && $emitted >= $count;
         select(undef, undef, undef, $interval);
     }
     return 0;
+}
+
+# Remember which records were already emitted. Keyed by type and millisecond timestamp.
+sub _seen {
+    my ($self, $r) = @_;
+    my $key = $r->{type} . ':' . int($r->{time} * 100 + 0.5);
+    return 1 if $self->{seen}{$key};
+    if (keys %{$self->{seen}} >= SEEN_LIMIT) {
+        $self->{seen} = {};
+    }
+    $self->{seen}{$key} = 1;
+    return 0;
+}
+
+# Write one record in the selected format.
+sub emit {
+    my ($self, $r) = @_;
+    my $fh = $self->{out};
+    if ($self->{format} eq 'json') {
+        my %h = %$r;
+        $h{time} = iso_time($r->{time});
+        print {$fh} $self->{json}->encode(\%h), "\n";
+    } elsif ($self->{format} eq 'csv') {
+        if ($self->{csv_header_due}) {
+            print {$fh} join(',', @CSV_COLS), "\n";
+            $self->{csv_header_due} = 0;
+        }
+        my %h = %$r;
+        $h{time} = iso_time($r->{time});
+        print {$fh} join(',', map { csv_field($h{$_}) } @CSV_COLS), "\n";
+    } else {
+        print {$fh} format_record($r), "\n";
+    }
+}
+
+sub iso_time {
+    my ($t) = @_;
+    my $whole = int($t);
+    my $ms = int(($t - $whole) * 1000);
+    return sprintf('%s.%03d%s',
+        strftime('%Y-%m-%dT%H:%M:%S', localtime($whole)),
+        $ms,
+        strftime('%z', localtime($whole)));
+}
+
+sub csv_field {
+    my ($v) = @_;
+    return '' unless defined $v;
+    if ($v =~ /[,"\r\n]/) {
+        (my $q = $v) =~ s/"/""/g;
+        return qq("$q");
+    }
+    return $v;
 }
 
 sub format_record {
@@ -706,16 +1080,26 @@ sub print_usage {
     print <<"EOF";
 Usage: $0 -d AA:BB:CC:DD:EE:FF [actions] [options]
 
-Actions (default: live realtime readings):
+Actions (default: live readings):
   --info          Show serial number and firmware version
+  --status        Show device status registers (count rate, dose rate, temp, battery)
+  --spectrum      Read the current energy spectrum (summary; CSV/JSON give all channels)
+  --accum         With --spectrum: read the accumulated spectrum instead
   --config        Dump device configuration (text)
   --buffer        Dump all buffered records once
-  (none)          Poll realtime count/dose rate; Ctrl-C to stop
+  (none)          Poll buffered records and emit new ones; Ctrl-C to stop
+
+Output (records from --buffer and live mode):
+  -f, --format FMT         text|csv|json (default: text)
+  -o, --output FILE        Append output to FILE instead of STDOUT
+                           (CSV header is written only when FILE is empty/new)
+  --backfill               Live mode: also emit records already in the device buffer
+                           at start (default: only records that arrive after start)
 
 Options:
   -d, --device ADDR        BLE address of the RadiaCode (required)
   -i, --interval SEC       Poll interval for live mode (default: 2)
-  -n, --count N            Stop live mode after N readings (default: forever)
+  -n, --count N            Stop live mode after N records (default: forever)
   --addr-type TYPE         public|random (default: public)
   --connect-timeout SEC    Connect timeout in seconds (default: 5)
   --write-uuid UUID        Write characteristic (default: e63215e6-7003-49d8-96b0-b024798fb901)
@@ -724,7 +1108,10 @@ Options:
   -h, --help               Show this help
 
 Examples:
-  $0 -d 52:43:01:02:03:04 --info
-  $0 -d 52:43:01:02:03:04 --interval 1 -n 20
+  $0 -d 52:43:06:E0:0C:23 --info
+  $0 -d 52:43:06:E0:0C:23 --status
+  $0 -d 52:43:06:E0:0C:23 -i 1 -n 20
+  $0 -d 52:43:06:E0:0C:23 -i 5 --format csv -o readings.csv
+  $0 -d 52:43:06:E0:0C:23 --format json --buffer
 EOF
 }
