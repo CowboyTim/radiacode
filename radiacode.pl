@@ -225,7 +225,7 @@ BEGIN {
     @CTRL_NAME = (
         'buttons', 'clicks', 'dose-rate-alarm-1', 'dose-rate-alarm-2', 'dose-rate-off-scale',
         'dose-alarm-1', 'dose-alarm-2', 'dose-off-scale',
-        'bit8', 'bit9',                 # sound only so far, not identified
+        'unused8', 'unused9',           # no menu option found; not used by the device UI
         'count-rate-alarm-1',           # bit 10: vibration (menu check)
         'count-rate-alarm-2',           # bit 11: vibration on, sound turned on (menu check)
         'count-rate-off-scale',         # bit 12: vibration (menu check)
