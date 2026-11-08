@@ -203,7 +203,7 @@ use constant {
 # 4-byte little-endian register value]. Templates follow cdump/radiacode _VSFR_FORMATS.
 # These are set in BEGIN blocks because the main program (which calls run()) appears
 # above this package in the file, so plain file-scope assignments would not have run yet.
-my (%STATUS_VSFR, @CSV_COLS, %EVENT_NAME);
+my (%STATUS_VSFR, @CSV_COLS, %EVENT_NAME, @CTRL_NAME);
 BEGIN {
     %STATUS_VSFR = (
         device_on   => [0x0503, 'V'],       # DEVICE_ON   (value is in the low byte; nonzero = on)
@@ -219,6 +219,14 @@ BEGIN {
     # Column order for CSV output.
     @CSV_COLS = qw(time type count count_rate count_rate_err dose_rate dose_rate_err
                    flags rt_flags duration dose temperature charge_level event event_name event_param1);
+
+    # Per-event sound/vibration bits (SOUND_CTRL 0x0520, VIBRO_CTRL 0x0530). Bits 0-7 are
+    # cdump's CTRL enum. Bits 8-12 appear on firmware 4.15; names not confirmed yet.
+    @CTRL_NAME = (
+        'buttons', 'clicks', 'dose-rate-alarm-1', 'dose-rate-alarm-2', 'dose-rate-off-scale',
+        'dose-alarm-1', 'dose-alarm-2', 'dose-off-scale',
+        map { "bit$_" } 8 .. 31,
+    );
 
     # Device event ids (cdump EventId). Alarm events are DOSE_RATE_ALARM1/2 (9, 10),
     # DOSE_ALARM1/2 (12, 13), COUNT_RATE_ALARM1/2 (20, 21) and the OFFSCALE events.
@@ -744,10 +752,41 @@ sub encode_setting {
 # Observed on RC-110 (fw 4.14): lowering dose alarm 2 below dose alarm 1 also lowers
 # dose alarm 1 to match, so alarm 1 never sits above alarm 2. Set alarm 2 first when
 # lowering both, and check --alarms afterwards.
+# Turn one per-event sound or vibration bit on or off (read-modify-write of the whole
+# register, so the other events keep their state). Returns true when read back as sent.
+sub set_event_bit {
+    my ($self, $kind, $event, $value) = @_;
+    my $id = $kind eq 'sound' ? 0x0520 : 0x0530;
+    my $on = lc($value // '') eq 'on' ? 1 : lc($value // '') eq 'off' ? 0 : undef;
+    unless (defined $on) {
+        print STDERR "ERROR: $kind-$event=$value: expects on or off\n";
+        return 0;
+    }
+    my ($old) = $self->read_vsfrs_raw($id);
+    unless (defined $old) {
+        print STDERR "ERROR: $kind-$event: could not read the current mask\n";
+        return 0;
+    }
+    my $bitpos = (grep { $CTRL_NAME[$_] eq $event } 0 .. $#CTRL_NAME)[0];
+    my $new = $on ? ($old | (1 << $bitpos)) : ($old & ~(1 << $bitpos)) & 0xFFFFFFFF;
+    unless ($self->write_vsfr($id, pack('V', $new))) {
+        print STDERR "ERROR: $kind-$event: the device rejected the write\n";
+        return 0;
+    }
+    my ($read) = $self->read_vsfrs_raw($id);
+    my $ok = defined $read && $read == $new;
+    printf "%-20s mask 0x%X -> 0x%X (device reads 0x%X) %s\n", "$kind-$event:",
+        $old, $new, $read // 0, $ok ? 'OK' : 'MISMATCH';
+    return $ok ? 1 : 0;
+}
+
 # Write one setting, read it back and report. Returns true when the device reads back
 # the value that was written.
 sub set_setting {
     my ($self, $name, $value) = @_;
+    if ($name =~ /^(sound|vibration)-(.+)$/ && grep { $_ eq $2 } @CTRL_NAME) {
+        return $self->set_event_bit($1, $2, $value);
+    }
     my @units = $self->read_vsfrs_raw(0x8013, 0x8004);     # CR_UNITS, DS_UNITS
     my $ctx = {
         cr_cpm => (defined $units[0] && $units[0]) ? 1 : 0,
@@ -1148,10 +1187,11 @@ sub print_alarms {
 sub read_settings {
     my ($self) = @_;
     my @ids = (0x0511, 0x0512, 0x0513, 0x0515, 0x0516,   # BRT, CONTR, OFF_TIME, DIR, BACKLT_ON
-               0x0521, 0x0522, 0x0531, 0x0502);          # SOUND_VOL, SOUND_ON, VIBRO_ON, LANG
+               0x0521, 0x0522, 0x0531, 0x0502,           # SOUND_VOL, SOUND_ON, VIBRO_ON, LANG
+               0x0520, 0x0530);                          # SOUND_CTRL, VIBRO_CTRL (per event)
     my @r = $self->read_vsfrs_raw(@ids);
     return unless @r;
-    my ($brt, $contr, $off, $dir, $bl, $vol, $snd, $vib, $lang) = @r;
+    my ($brt, $contr, $off, $dir, $bl, $vol, $snd, $vib, $lang, $sctl, $vctl) = @r;
     my %s;
     $s{brightness}   = $brt   if defined $brt;
     $s{contrast}     = $contr if defined $contr;
@@ -1166,6 +1206,12 @@ sub read_settings {
     $s{sound_on}     = $snd ? 1 : 0 if defined $snd;
     $s{vibro_on}     = $vib ? 1 : 0 if defined $vib;
     $s{language}     = defined $lang ? ($lang ? 'ru' : 'en') : undef;   # observed mapping, see above
+    if (defined $sctl) {
+        $s{sound_events}     = { map { $CTRL_NAME[$_] => (($sctl >> $_) & 1) ? 1 : 0 } 0 .. $#CTRL_NAME };
+    }
+    if (defined $vctl) {
+        $s{vibration_events} = { map { $CTRL_NAME[$_] => (($vctl >> $_) & 1) ? 1 : 0 } 0 .. $#CTRL_NAME };
+    }
     return \%s;
 }
 
@@ -1191,6 +1237,12 @@ sub print_settings {
         [vibro_on        => 'Vibration',       sub { $_[0] ? 'on' : 'off' }],
         [language        => 'Language',        sub { $_[0] }],
     );
+    for my $k (qw(sound_events vibration_events)) {
+        next unless $s->{$k};
+        my $label = $k eq 'sound_events' ? 'Sound per event' : 'Vibration per event';
+        my @on = grep { $s->{$k}{$_} } @CTRL_NAME;
+        printf "%-20s %s\n", "$label:", @on ? join(', ', @on) : '(none)';
+    }
     for my $row (@order) {
         my ($k, $name, $fmt) = @$row;
         next unless exists $s->{$k};
@@ -1842,6 +1894,8 @@ Actions (default: live readings):
                   direction (auto|right|left), backlight, sound, vibration (on|off),
                   alarm-count-1|2 (count unit), alarm-dose-rate-1|2 and alarm-dose-1|2
                   (uSv or uR, following the device units). Count alarms take cps or cpm.
+                  sound-EVENT / vibration-EVENT (on|off) per alarm event, e.g.
+                  vibration-dose-rate-off-scale=off (see --settings for the names).
   --spectrum-reset  Clear the device's current spectrum (writes to the device).
                   The monitor handles this itself: it logs the reset and rebases.
   --set-time [T]  Write the device clock: 'now' (default) or 'YYYY-MM-DD HH:MM:SS'
