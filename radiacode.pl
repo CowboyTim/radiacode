@@ -223,7 +223,7 @@ BEGIN {
     # Per-event sound/vibration bits (SOUND_CTRL 0x0520, VIBRO_CTRL 0x0530). Bits 0-7 are
     # cdump's CTRL enum. Bits 8-12 appear on firmware 4.15; bits 10-12 are named from menu checks.
     @CTRL_NAME = (
-        'buttons', 'clicks', 'dose-rate-alarm-1', 'dose-rate-alarm-2', 'dose-rate-off-scale',
+        'buttons', 'particle-registration', 'dose-rate-alarm-1', 'dose-rate-alarm-2', 'dose-rate-off-scale',
         'dose-alarm-1', 'dose-alarm-2', 'dose-off-scale',
         'unused8', 'unused9',           # no menu option found; not used by the device UI
         'count-rate-alarm-1',           # bit 10: vibration (menu check)
