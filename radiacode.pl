@@ -57,6 +57,8 @@ my $do_monitor = 0;
 my $plot_dir;   # undef = not requested; '' = use --dir (or ./radiacode-data)
 my $do_spectrum_reset = 0;
 my $do_poweroff = 0;
+my $do_energy_calib = 0;
+my $set_energy_calib;   # 'a0,a1,a2' to write
 my @set_args;   # --set NAME=VALUE, repeatable
 my $set_time;   # undef = not requested; '' or 'now' = host clock; or 'YYYY-MM-DD HH:MM:SS'
 
@@ -81,6 +83,8 @@ GetOptions(
     'spectrum-reset'    => \$do_spectrum_reset,
     'set=s@'            => \@set_args,
     'poweroff'          => \$do_poweroff,
+    'energy-calib'      => \$do_energy_calib,
+    'set-energy-calib=s' => \$set_energy_calib,
     'monitor'           => \$do_monitor,
     'plot:s'            => \$plot_dir,
     'dir=s'             => \$opts{dir},
@@ -135,6 +139,8 @@ exit $rc_dev->run(
     set_time => $set_time,
     spectrum_reset => $do_spectrum_reset,
     poweroff       => $do_poweroff,
+    energy_calib   => $do_energy_calib,
+    set_energy_calib => $set_energy_calib,
     set            => \@set_args,
     config   => $do_config,
     buffer   => $do_buffer,
@@ -193,6 +199,7 @@ use constant {
     VS_DATA_BUF               => 0x0100,
     VS_SPECTRUM               => 0x0200,
     VS_SPEC_ACCUM             => 0x0205,
+    VS_ENERGY_CALIB           => 0x0202,
 
     # Virtual SFRs
     VSFR_DEVICE_TIME          => 0x0504,
@@ -326,6 +333,12 @@ sub run {
             }
             $rc = 1 unless $self->set_setting($name, $value);
         }
+        if ($todo{energy_calib}) {
+            $rc |= $self->print_energy_calib();
+        }
+        if (defined $todo{set_energy_calib}) {
+            $rc |= $self->print_set_energy_calib($todo{set_energy_calib});
+        }
         if ($todo{poweroff}) {
             $rc |= $self->print_poweroff();
         }
@@ -355,7 +368,8 @@ sub run {
         }
         if (!$todo{info} && !$todo{status} && !$todo{config} && !$todo{buffer} && !$todo{spectrum}
             && !$todo{alarms} && !$todo{settings} && !defined $todo{set_time}
-            && !$todo{spectrum_reset} && !$todo{poweroff} && !@{ $todo{set} || [] }) {
+            && !$todo{spectrum_reset} && !$todo{poweroff} && !$todo{energy_calib}
+            && !defined $todo{set_energy_calib} && !@{ $todo{set} || [] }) {
             $rc |= $self->live($todo{interval}, $todo{count});
         }
         1;
@@ -824,6 +838,57 @@ sub set_setting {
     printf "%-20s raw %s -> %s (device reads %s) %s\n", "$name:",
         $old // 'n/a', $raw, $new // 'n/a', $ok ? 'OK' : 'MISMATCH';
     return $ok ? 1 : 0;
+}
+
+# Energy calibration (VS 0x0202): three little-endian floats a0, a1, a2. Channel to keV is
+# a0 + a1*ch + a2*ch^2 (see channel_to_keV). Read: read_vs. Write: WR_VIRT_STRING with the
+# id, the length and the three floats; retcode 1 on success.
+sub read_energy_calib {
+    my ($self) = @_;
+    my $raw = $self->read_vs(VS_ENERGY_CALIB) or return;
+    return unless length($raw) == 12;
+    return unpack('f<f<f<', $raw);
+}
+
+sub write_energy_calib {
+    my ($self, @coef) = @_;
+    my $pc = pack('f<f<f<', @coef);
+    my $r = $self->execute(CMD_WR_VIRT_STRING, pack('V V', VS_ENERGY_CALIB, length $pc) . $pc)
+        or return 0;
+    return length($r) >= 4 && unpack('V', substr($r, 0, 4)) == 1;
+}
+
+sub print_energy_calib {
+    my ($self) = @_;
+    my @c = $self->read_energy_calib();
+    unless (@c) {
+        print STDERR "ERROR: could not read the energy calibration\n";
+        return 1;
+    }
+    # 9 significant digits round-trip a 32-bit float, so this output can be written back exactly.
+    printf "Energy calibration: a0=%.9g keV  a1=%.9g keV/ch  a2=%.9g keV/ch^2\n", @c;
+    printf "Write back with: --set-energy-calib %.9g,%.9g,%.9g\n", @c;
+    return 0;
+}
+
+# --set-energy-calib A0,A1,A2: write the three coefficients and read them back.
+sub print_set_energy_calib {
+    my ($self, $value) = @_;
+    my @coef = split /,/, $value // '';
+    unless (@coef == 3 && !grep { !/^-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?$/ } @coef) {
+        print STDERR "ERROR: --set-energy-calib expects A0,A1,A2 (three numbers)\n";
+        return 1;
+    }
+    @coef = map { $_ + 0 } @coef;
+    unless ($self->write_energy_calib(@coef)) {
+        print STDERR "ERROR: the device rejected the energy calibration\n";
+        return 1;
+    }
+    my @back = $self->read_energy_calib();
+    my $ok = @back == 3 && !grep { abs($back[$_] - $coef[$_]) > 1e-6 * (1 + abs($coef[$_])) } 0 .. 2;
+    printf "Energy calibration written: a0=%s a1=%s a2=%s (device reads %s) %s\n",
+        @coef, join(',', map { defined $_ ? $_ : 'n/a' } @back), $ok ? 'OK' : 'MISMATCH';
+    return $ok ? 0 : 1;
 }
 
 # Power the device down (DEVICE_ON = 0). It then needs its own button to wake, and BLE is
@@ -1937,6 +2002,10 @@ Actions (default: live readings):
 
                   sound-EVENT / vibration-EVENT (on|off) per alarm event, e.g.
                   vibration-dose-rate-off-scale=off (see --settings for the names).
+  --energy-calib  Read the energy calibration (a0, a1, a2) used for keV labels.
+  --set-energy-calib A0,A1,A2
+                  Write the energy calibration and read it back. Changes only the keV
+                  labels of the spectrum, not counts or dose.
   --poweroff      Power the device down (needs its button to wake). Writes to the device.
   --spectrum-reset  Clear the device's current spectrum (writes to the device).
                   The monitor handles this itself: it logs the reset and rebases.
