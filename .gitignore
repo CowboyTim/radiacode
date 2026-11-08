@@ -1,0 +1,9 @@
+*~
+# CocoIndex Code (ccc)
+/.cocoindex_code/
+# build output
+/dist/
+/halloween-bang/build/
+/.build/
+__pycache__/
+tools/bench/out/
