@@ -12,3 +12,4 @@ tools/bench/out/
 # saved spectrum exports
 /spectrum_current.csv
 /spectrum_current.json
+/spectrum_current.svg
