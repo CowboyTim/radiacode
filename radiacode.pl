@@ -56,6 +56,7 @@ my ($do_info, $do_config, $do_buffer, $do_status, $do_spectrum, $do_accum,
 my $do_monitor = 0;
 my $plot_dir;   # undef = not requested; '' = use --dir (or ./radiacode-data)
 my $do_spectrum_reset = 0;
+my @set_args;   # --set NAME=VALUE, repeatable
 my $set_time;   # undef = not requested; '' or 'now' = host clock; or 'YYYY-MM-DD HH:MM:SS'
 
 GetOptions(
@@ -77,6 +78,7 @@ GetOptions(
     'settings'          => \$do_settings,
     'set-time:s'        => \$set_time,
     'spectrum-reset'    => \$do_spectrum_reset,
+    'set=s@'            => \@set_args,
     'monitor'           => \$do_monitor,
     'plot:s'            => \$plot_dir,
     'dir=s'             => \$opts{dir},
@@ -130,6 +132,7 @@ exit $rc_dev->run(
     settings => $do_settings,
     set_time => $set_time,
     spectrum_reset => $do_spectrum_reset,
+    set            => \@set_args,
     config   => $do_config,
     buffer   => $do_buffer,
     count    => $opts{count},
@@ -299,6 +302,15 @@ sub run {
         if (defined $todo{set_time}) {
             $rc |= $self->print_set_time($todo{set_time});
         }
+        for my $pair (@{ $todo{set} || [] }) {
+            my ($name, $value) = split /=/, $pair, 2;
+            unless (defined $value) {
+                print STDERR "ERROR: --set expects NAME=VALUE, got '$pair'\n";
+                $rc = 1;
+                next;
+            }
+            $rc = 1 unless $self->set_setting($name, $value);
+        }
         if ($todo{spectrum_reset}) {
             $rc |= $self->print_spectrum_reset();
         }
@@ -325,7 +337,7 @@ sub run {
         }
         if (!$todo{info} && !$todo{status} && !$todo{config} && !$todo{buffer} && !$todo{spectrum}
             && !$todo{alarms} && !$todo{settings} && !defined $todo{set_time}
-            && !$todo{spectrum_reset}) {
+            && !$todo{spectrum_reset} && !@{ $todo{set} || [] }) {
             $rc |= $self->live($todo{interval}, $todo{count});
         }
         1;
@@ -666,6 +678,100 @@ sub send_clock {
 
 # --set-time: write a clock value to the device. Value 'now' (or empty) uses the host
 # clock; otherwise 'YYYY-MM-DD HH:MM:SS' is taken as the device's local time.
+# ---- Device writes: --set NAME=VALUE ----
+# encode_setting() turns a user value into (register id, raw register value). It is a pure
+# function so it can be tested without a device. $ctx carries the device unit switches:
+#   cr_cpm: 1 when count-rate alarms are shown in cpm (stored as cps * 10 either way)
+#   ds_sv:  1 when dose values are in Sv (stored as micro-units * 100); 0 for R (micro-R)
+sub _round { my $x = shift; return $x < 0 ? -int(-$x + 0.5) : int($x + 0.5) }
+
+sub encode_setting {
+    my ($name, $value, $ctx) = @_;
+    $ctx //= { cr_cpm => 0, ds_sv => 0 };
+    my $num = sub {
+        my $v = shift;
+        die "expects a number\n" unless defined $v && $v =~ /^-?\d+(?:\.\d+)?$/;
+        return $v + 0;
+    };
+    my $onoff = sub {
+        my $v = lc($_[0] // '');
+        return 1 if $v eq 'on';
+        return 0 if $v eq 'off';
+        die "expects on or off\n";
+    };
+
+    if ($name eq 'brightness') {
+        my $v = $num->($value);
+        die "must be 0-9\n" unless $v == int($v) && $v >= 0 && $v <= 9;
+        return (0x0511, $v);
+    }
+    if ($name eq 'display-off') {
+        my $v = $num->($value);
+        # Only these four map to distinct device values (20 s and 30 s share raw 3).
+        die "must be 5, 10, 15 or 30 seconds\n" unless grep { $v == $_ } 5, 10, 15, 30;
+        return (0x0513, $v == 30 ? 3 : $v / 5 - 1);     # inverse of the read side
+    }
+    if ($name eq 'direction') {
+        my %d = (auto => 0, right => 1, left => 2);
+        die "must be auto, right or left\n" unless exists $d{lc($value // '')};
+        return (0x0515, $d{lc $value});
+    }
+    if ($name eq 'backlight') { return (0x0516, $onoff->($value)) }
+    if ($name eq 'sound')     { return (0x0522, $onoff->($value)) }
+    if ($name eq 'vibration') { return (0x0531, $onoff->($value)) }
+
+    if ($name =~ /^alarm-(count|dose-rate|dose)-([12])$/) {
+        my ($kind, $lvl) = ($1, $2);
+        my $v = $num->($value);
+        if ($kind eq 'count') {
+            my $cps = $ctx->{cr_cpm} ? $v / 60 : $v;     # value is in the device's count unit
+            die "must be 0.1 to 50000 cps\n" unless $cps >= 0.1 && $cps <= 50e3;
+            return ($lvl == 1 ? 0x8008 : 0x8009, _round($cps * 10));
+        }
+        # dose-rate: uSv/h (Sv) or uR/h; dose: uSv (Sv) or uR. Raw = micro-unit * 100 for Sv.
+        my $mult = $ctx->{ds_sv} ? 100 : 1;
+        my $raw  = _round($v * $mult);
+        die "must be 0 or more\n" if $v < 0;
+        die "value too large for the device\n" if $raw > 999999999;
+        if ($kind eq 'dose-rate') {
+            return ($lvl == 1 ? 0x8000 : 0x8001, $raw);
+        }
+        return ($lvl == 1 ? 0x8014 : 0x8015, $raw);
+    }
+    die "unknown setting '$name'\n";
+}
+
+# Observed on RC-110 (fw 4.14): lowering dose alarm 2 below dose alarm 1 also lowers
+# dose alarm 1 to match, so alarm 1 never sits above alarm 2. Set alarm 2 first when
+# lowering both, and check --alarms afterwards.
+# Write one setting, read it back and report. Returns true when the device reads back
+# the value that was written.
+sub set_setting {
+    my ($self, $name, $value) = @_;
+    my @units = $self->read_vsfrs_raw(0x8013, 0x8004);     # CR_UNITS, DS_UNITS
+    my $ctx = {
+        cr_cpm => (defined $units[0] && $units[0]) ? 1 : 0,
+        ds_sv  => (defined $units[1] && $units[1]) ? 1 : 0,
+    };
+    my ($id, $raw) = eval { encode_setting($name, $value, $ctx) };
+    unless (defined $id) {
+        my $err = $@ || "invalid value\n";
+        $err =~ s/\n\z//;
+        print STDERR "ERROR: $name=$value: $err\n";
+        return 0;
+    }
+    my ($old) = $self->read_vsfrs_raw($id);
+    unless ($self->write_vsfr($id, pack('V', $raw))) {
+        print STDERR "ERROR: $name: the device rejected the write\n";
+        return 0;
+    }
+    my ($new) = $self->read_vsfrs_raw($id);
+    my $ok = defined $new && $new == $raw;
+    printf "%-20s raw %s -> %s (device reads %s) %s\n", "$name:",
+        $old // 'n/a', $raw, $new // 'n/a', $ok ? 'OK' : 'MISMATCH';
+    return $ok ? 1 : 0;
+}
+
 # Clear the device's current (cumulative) spectrum. Command 0x0827 (WR_VIRT_STRING) with
 # the spectrum id and a zero length, as cdump's spectrum_reset(). The device answers with
 # retcode 1 and no payload on success.
@@ -1731,6 +1837,11 @@ Actions (default: live readings):
   --status        Show device status registers (count rate, dose rate, temp, battery)
   --spectrum      Read the current energy spectrum (summary; CSV/JSON give all channels)
   --accum         With --spectrum: read the accumulated spectrum instead
+  --set NAME=VALUE  Write a device setting, read it back and report (writes to the device;
+                  repeatable). Names: brightness (0-9), display-off (5, 10, 15 or 30 s),
+                  direction (auto|right|left), backlight, sound, vibration (on|off),
+                  alarm-count-1|2 (count unit), alarm-dose-rate-1|2 and alarm-dose-1|2
+                  (uSv or uR, following the device units). Count alarms take cps or cpm.
   --spectrum-reset  Clear the device's current spectrum (writes to the device).
                   The monitor handles this itself: it logs the reset and rebases.
   --set-time [T]  Write the device clock: 'now' (default) or 'YYYY-MM-DD HH:MM:SS'
