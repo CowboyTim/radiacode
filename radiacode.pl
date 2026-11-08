@@ -46,7 +46,8 @@ my %opts = (
     backfill          => 0,
 );
 
-my ($do_info, $do_config, $do_buffer, $do_status, $do_spectrum, $do_accum) = (0, 0, 0, 0, 0, 0);
+my ($do_info, $do_config, $do_buffer, $do_status, $do_spectrum, $do_accum,
+    $do_alarms, $do_settings) = (0) x 8;
 
 GetOptions(
     'device|d=s'        => \$opts{device},
@@ -63,6 +64,8 @@ GetOptions(
     'status'            => \$do_status,
     'spectrum'          => \$do_spectrum,
     'accum'             => \$do_accum,
+    'alarms'            => \$do_alarms,
+    'settings'          => \$do_settings,
     'config'            => \$do_config,
     'buffer'            => \$do_buffer,
     'debug|v+'          => \$opts{debug},
@@ -97,6 +100,8 @@ exit $rc_dev->run(
     status   => $do_status,
     spectrum => $do_spectrum,
     accum    => $do_accum,
+    alarms   => $do_alarms,
+    settings => $do_settings,
     config   => $do_config,
     buffer   => $do_buffer,
     count    => $opts{count},
@@ -165,14 +170,14 @@ use constant {
 my (%STATUS_VSFR, @CSV_COLS);
 BEGIN {
     %STATUS_VSFR = (
-        device_on   => [0x0503, 'x3 C'],    # DEVICE_ON   (3x?)
+        device_on   => [0x0503, 'V'],       # DEVICE_ON   (value is in the low byte; nonzero = on)
         cps         => [0x8020, 'V'],       # CPS         (counts per second)
         dr_uR_h     => [0x8021, 'V'],       # DR_uR_h     (dose rate, micro-R/h)
         ds_uR       => [0x8022, 'V'],       # DS_uR       (accumulated dose, micro-R)
         temp_c      => [0x8024, 'f<'],      # TEMP_degC   (float)
-        acc_x       => [0x8025, 'x2 s<'],   # ACC_X       (int16)
-        acc_y       => [0x8026, 'x2 s<'],   # ACC_Y
-        acc_z       => [0x8027, 'x2 s<'],   # ACC_Z
+        acc_x       => [0x8025, 's<'],      # ACC_X       (int16, low bytes)
+        acc_y       => [0x8026, 's<'],      # ACC_Y
+        acc_z       => [0x8027, 's<'],      # ACC_Z
     );
 
     # Column order for CSV output.
@@ -258,13 +263,20 @@ sub run {
         if ($todo{spectrum}) {
             $rc |= $self->print_spectrum($todo{accum});
         }
+        if ($todo{alarms}) {
+            $rc |= $self->print_alarms();
+        }
+        if ($todo{settings}) {
+            $rc |= $self->print_settings();
+        }
         if ($todo{config}) {
             $rc |= $self->print_config();
         }
         if ($todo{buffer}) {
             $rc |= $self->print_buffer();
         }
-        if (!$todo{info} && !$todo{status} && !$todo{config} && !$todo{buffer} && !$todo{spectrum}) {
+        if (!$todo{info} && !$todo{status} && !$todo{config} && !$todo{buffer} && !$todo{spectrum}
+            && !$todo{alarms} && !$todo{settings}) {
             $rc |= $self->live($todo{interval}, $todo{count});
         }
         1;
@@ -841,6 +853,125 @@ sub print_spectrum {
     return 0;
 }
 
+# Alarm thresholds (read-only). Scaling follows cdump get_alarm_limits and was checked
+# against the device: count = raw/10 (x60 for cpm); dose rate = raw/100 for Sv (uSv/h);
+# accumulated dose = raw/1e6/100 for Sv. A raw value of 999999999 is the device's maximum.
+sub read_alarms {
+    my ($self) = @_;
+    my @ids = (0x8008, 0x8009, 0x8013,    # CR_LEV1_cp10s, CR_LEV2_cp10s, CR_UNITS
+               0x8000, 0x8001, 0x8004,    # DR_LEV1_uR_h,  DR_LEV2_uR_h,  DS_UNITS
+               0x8014, 0x8015);           # DS_LEV1_uR,    DS_LEV2_uR
+    my @r = $self->read_vsfrs_raw(@ids);
+    return unless @r;
+    my ($cr1, $cr2, $cr_u, $dr1, $dr2, $ds_u, $ds1, $ds2) = @r;
+
+    my $cpm = (defined $cr_u && $cr_u) ? 1 : 0;
+    my $sv  = (defined $ds_u && $ds_u) ? 1 : 0;
+    my $dm  = $sv ? 100 : 1;
+    my $max = 999999999;
+    my $cm  = $cpm ? 60 : 1;
+
+    my %a = (
+        count_unit      => $cpm ? 'cpm' : 'cps',
+        dose_unit       => $sv ? 'Sv' : 'R',
+        dose_rate_unit  => $sv ? 'uSv/h' : 'uR/h',
+        raw             => { cr1 => $cr1, cr2 => $cr2, dr1 => $dr1, dr2 => $dr2,
+                             ds1 => $ds1, ds2 => $ds2 },
+    );
+    $a{count_level1}     = defined $cr1 ? $cr1 / 10 * $cm : undef;
+    $a{count_level2}     = defined $cr2 ? $cr2 / 10 * $cm : undef;
+    $a{dose_rate_level1} = defined $dr1 ? $dr1 / $dm : undef;
+    $a{dose_rate_level2} = defined $dr2 ? $dr2 / $dm : undef;
+    $a{dose_level1}      = defined $ds1 ? $ds1 / 1e6 / $dm : undef;
+    $a{dose_level2}      = defined $ds2 ? $ds2 / 1e6 / $dm : undef;
+    $a{dose_level1_at_max} = (defined $ds1 && $ds1 == $max) ? 1 : 0;
+    $a{dose_level2_at_max} = (defined $ds2 && $ds2 == $max) ? 1 : 0;
+    return \%a;
+}
+
+sub print_alarms {
+    my ($self) = @_;
+    my $a = $self->read_alarms();
+    unless ($a) {
+        print STDERR "ERROR: could not read alarm settings\n";
+        return 1;
+    }
+    if ($self->{format} eq 'json') {
+        print {$self->{out}} $self->{json}->encode($a), "\n";
+        return 0;
+    }
+    my $cu = $a->{count_unit};
+    my $du = $a->{dose_unit};
+    my $ru = $a->{dose_rate_unit};
+    printf "Count rate alarm 1:   %.2f %s (raw %s)\n", $a->{count_level1}, $cu, $a->{raw}{cr1};
+    printf "Count rate alarm 2:   %.2f %s (raw %s)\n", $a->{count_level2}, $cu, $a->{raw}{cr2};
+    printf "Dose rate alarm 1:    %.2f %s (raw %s)\n", $a->{dose_rate_level1}, $ru, $a->{raw}{dr1};
+    printf "Dose rate alarm 2:    %.2f %s (raw %s)\n", $a->{dose_rate_level2}, $ru, $a->{raw}{dr2};
+    printf "Dose alarm 1:         %.6g %s (raw %s%s)\n", $a->{dose_level1}, $du, $a->{raw}{ds1},
+        $a->{dose_level1_at_max} ? ', device maximum' : '';
+    printf "Dose alarm 2:         %.6g %s (raw %s%s)\n", $a->{dose_level2}, $du, $a->{raw}{ds2},
+        $a->{dose_level2_at_max} ? ', device maximum' : '';
+    return 0;
+}
+
+# Display, sound and language settings (read-only). Decoding follows cdump's setters:
+#   display off-time: raw 3 = 30 s, otherwise (raw + 1) * 5 s
+#   direction: 0 auto, 1 right, 2 left
+#   language: 1 = en, 0 = ru (cdump set_language)
+sub read_settings {
+    my ($self) = @_;
+    my @ids = (0x0511, 0x0512, 0x0513, 0x0515, 0x0516,   # BRT, CONTR, OFF_TIME, DIR, BACKLT_ON
+               0x0521, 0x0522, 0x0531, 0x0502);          # SOUND_VOL, SOUND_ON, VIBRO_ON, LANG
+    my @r = $self->read_vsfrs_raw(@ids);
+    return unless @r;
+    my ($brt, $contr, $off, $dir, $bl, $vol, $snd, $vib, $lang) = @r;
+    my %s;
+    $s{brightness}   = $brt   if defined $brt;
+    $s{contrast}     = $contr if defined $contr;
+    if (defined $off) {
+        $s{display_off_s} = $off == 3 ? 30 : ($off + 1) * 5;
+    }
+    if (defined $dir) {
+        $s{direction} = { 0 => 'auto', 1 => 'right', 2 => 'left' }->{$dir} // "unknown($dir)";
+    }
+    $s{backlight_on} = $bl ? 1 : 0 if defined $bl;
+    $s{sound_volume} = $vol if defined $vol;
+    $s{sound_on}     = $snd ? 1 : 0 if defined $snd;
+    $s{vibro_on}     = $vib ? 1 : 0 if defined $vib;
+    $s{language}     = defined $lang ? ($lang ? 'en' : 'ru') : undef;
+    return \%s;
+}
+
+sub print_settings {
+    my ($self) = @_;
+    my $s = $self->read_settings();
+    unless ($s) {
+        print STDERR "ERROR: could not read settings\n";
+        return 1;
+    }
+    if ($self->{format} eq 'json') {
+        print {$self->{out}} $self->{json}->encode($s), "\n";
+        return 0;
+    }
+    my @order = (
+        [brightness      => 'Brightness',      sub { "$_[0] (0-9)" }],
+        [contrast        => 'Contrast',        sub { $_[0] }],
+        [display_off_s   => 'Display off after', sub { "$_[0] s" }],
+        [direction       => 'Orientation',     sub { $_[0] }],
+        [backlight_on    => 'Backlight',       sub { $_[0] ? 'on' : 'off' }],
+        [sound_on        => 'Sound',           sub { $_[0] ? 'on' : 'off' }],
+        [sound_volume    => 'Sound volume',    sub { $_[0] }],
+        [vibro_on        => 'Vibration',       sub { $_[0] ? 'on' : 'off' }],
+        [language        => 'Language',        sub { $_[0] }],
+    );
+    for my $row (@order) {
+        my ($k, $name, $fmt) = @$row;
+        next unless exists $s->{$k};
+        printf "%-20s %s\n", "$name:", $fmt->($s->{$k});
+    }
+    return 0;
+}
+
 sub print_info {
     my ($self) = @_;
     my $ver = $self->fw_version();
@@ -1085,6 +1216,8 @@ Actions (default: live readings):
   --status        Show device status registers (count rate, dose rate, temp, battery)
   --spectrum      Read the current energy spectrum (summary; CSV/JSON give all channels)
   --accum         With --spectrum: read the accumulated spectrum instead
+  --alarms        Show count-rate, dose-rate and dose alarm thresholds (read-only)
+  --settings      Show display, sound, vibration and language settings (read-only)
   --config        Dump device configuration (text)
   --buffer        Dump all buffered records once
   (none)          Poll buffered records and emit new ones; Ctrl-C to stop
