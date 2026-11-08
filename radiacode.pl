@@ -55,6 +55,7 @@ my ($do_info, $do_config, $do_buffer, $do_status, $do_spectrum, $do_accum,
     $do_alarms, $do_settings) = (0) x 8;
 my $do_monitor = 0;
 my $plot_dir;   # undef = not requested; '' = use --dir (or ./radiacode-data)
+my $do_spectrum_reset = 0;
 my $set_time;   # undef = not requested; '' or 'now' = host clock; or 'YYYY-MM-DD HH:MM:SS'
 
 GetOptions(
@@ -75,6 +76,7 @@ GetOptions(
     'alarms'            => \$do_alarms,
     'settings'          => \$do_settings,
     'set-time:s'        => \$set_time,
+    'spectrum-reset'    => \$do_spectrum_reset,
     'monitor'           => \$do_monitor,
     'plot:s'            => \$plot_dir,
     'dir=s'             => \$opts{dir},
@@ -127,6 +129,7 @@ exit $rc_dev->run(
     alarms   => $do_alarms,
     settings => $do_settings,
     set_time => $set_time,
+    spectrum_reset => $do_spectrum_reset,
     config   => $do_config,
     buffer   => $do_buffer,
     count    => $opts{count},
@@ -176,6 +179,7 @@ use constant {
     CMD_WR_VIRT_SFR           => 0x0825,
     CMD_RD_VIRT_SFR_BATCH     => 0x082A,
     CMD_RD_VIRT_STRING        => 0x0826,
+    CMD_WR_VIRT_STRING        => 0x0827,
 
     # Virtual strings
     VS_CONFIGURATION          => 0x0002,
@@ -295,6 +299,9 @@ sub run {
         if (defined $todo{set_time}) {
             $rc |= $self->print_set_time($todo{set_time});
         }
+        if ($todo{spectrum_reset}) {
+            $rc |= $self->print_spectrum_reset();
+        }
         if ($todo{info}) {
             $rc |= $self->print_info();
         }
@@ -317,7 +324,8 @@ sub run {
             $rc |= $self->print_buffer();
         }
         if (!$todo{info} && !$todo{status} && !$todo{config} && !$todo{buffer} && !$todo{spectrum}
-            && !$todo{alarms} && !$todo{settings} && !defined $todo{set_time}) {
+            && !$todo{alarms} && !$todo{settings} && !defined $todo{set_time}
+            && !$todo{spectrum_reset}) {
             $rc |= $self->live($todo{interval}, $todo{count});
         }
         1;
@@ -658,6 +666,20 @@ sub send_clock {
 
 # --set-time: write a clock value to the device. Value 'now' (or empty) uses the host
 # clock; otherwise 'YYYY-MM-DD HH:MM:SS' is taken as the device's local time.
+# Clear the device's current (cumulative) spectrum. Command 0x0827 (WR_VIRT_STRING) with
+# the spectrum id and a zero length, as cdump's spectrum_reset(). The device answers with
+# retcode 1 and no payload on success.
+sub print_spectrum_reset {
+    my ($self) = @_;
+    my $r = $self->execute(CMD_WR_VIRT_STRING, pack('V V', VS_SPECTRUM, 0));
+    unless (defined $r && length($r) == 4 && unpack('V', $r) == 1) {
+        print STDERR "ERROR: spectrum reset failed\n";
+        return 1;
+    }
+    print "Spectrum reset: the current spectrum now starts from zero\n";
+    return 0;
+}
+
 sub print_set_time {
     my ($self, $value) = @_;
     my $epoch;
@@ -1681,6 +1703,8 @@ Actions (default: live readings):
   --status        Show device status registers (count rate, dose rate, temp, battery)
   --spectrum      Read the current energy spectrum (summary; CSV/JSON give all channels)
   --accum         With --spectrum: read the accumulated spectrum instead
+  --spectrum-reset  Clear the device's current spectrum (writes to the device).
+                  The monitor handles this itself: it logs the reset and rebases.
   --set-time [T]  Write the device clock: 'now' (default) or 'YYYY-MM-DD HH:MM:SS'
                   (local time, sent as-is). Writes to the device.
   --monitor       Long-running logger: rates.csv, events.csv (alarms and other device
