@@ -9,3 +9,6 @@ __pycache__/
 tools/bench/out/
 # radiacode --monitor default output
 /radiacode-data/
+# saved spectrum exports
+/spectrum_current.csv
+/spectrum_current.json
