@@ -19,6 +19,7 @@ is_deeply([ $enc->('display-off', 30) ], [0x0513, 3], 'display-off 30 s -> raw 3
 ok(!eval { $enc->('display-off', 12); 1 }, 'display-off 12 s refused');
 is_deeply([ $enc->('direction', 'LEFT') ], [0x0515, 2], 'direction is case-insensitive');
 is_deeply([ $enc->('direction', 'normal') ], [0x0515, 1], 'direction normal is raw 1');
+is_deeply([ $enc->('direction', 'rotated') ], [0x0515, 2], 'direction rotated is raw 2');
 is_deeply([ $enc->('backlight', 'on') ], [0x0516, 1], 'backlight on');
 is_deeply([ $enc->('sound', 'off') ], [0x0522, 0], 'sound off');
 is_deeply([ $enc->('vibration', 'on') ], [0x0531, 1], 'vibration on');

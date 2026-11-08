@@ -724,8 +724,8 @@ sub encode_setting {
         return (0x0513, $v == 30 ? 3 : $v / 5 - 1);     # inverse of the read side
     }
     if ($name eq 'direction') {
-        my %d = (auto => 0, normal => 1, right => 1, left => 2);
-        die "must be auto, normal or left\n" unless exists $d{lc($value // '')};
+        my %d = (auto => 0, normal => 1, right => 1, rotated => 2, left => 2);
+        die "must be auto, normal or rotated\n" unless exists $d{lc($value // '')};
         return (0x0515, $d{lc $value});
     }
     if ($name eq 'backlight') { return (0x0516, $onoff->($value)) }
@@ -1209,8 +1209,8 @@ sub read_settings {
         $s{display_off_s} = $off == 3 ? 30 : ($off + 1) * 5;
     }
     if (defined $dir) {
-        # 1 is the device's "normal" orientation (cdump calls it right); 2 is left.
-        $s{direction} = { 0 => 'auto', 1 => 'normal', 2 => 'left' }->{$dir} // "unknown($dir)";
+        # Menu names: 0 auto, 1 normal, 2 rotated (cdump calls 1 right and 2 left).
+        $s{direction} = { 0 => 'auto', 1 => 'normal', 2 => 'rotated' }->{$dir} // "unknown($dir)";
     }
     $s{backlight_on} = $bl ? 1 : 0 if defined $bl;
     $s{sound_volume} = $vol if defined $vol;
@@ -1906,7 +1906,7 @@ Actions (default: live readings):
   --accum         With --spectrum: read the accumulated spectrum instead
   --set NAME=VALUE  Write a device setting, read it back and report (writes to the device;
                   repeatable). Names: brightness (0-9), display-off (5, 10, 15 or 30 s),
-                  direction (auto|normal|left), backlight, sound, vibration (on|off),
+                  direction (auto|normal|rotated), backlight, sound, vibration (on|off),
                   alarm-count-1|2 (count unit), alarm-dose-rate-1|2 and alarm-dose-1|2
                   (uSv or uR, following the device units). Count alarms take cps or cpm.
                   alarm-mode (continuous|once) how the alarm signal repeats.
