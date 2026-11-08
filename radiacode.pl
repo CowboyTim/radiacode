@@ -225,7 +225,7 @@ BEGIN {
     @CTRL_NAME = (
         'buttons', 'particle-registration', 'dose-rate-alarm-1', 'dose-rate-alarm-2', 'dose-rate-off-scale',
         'dose-alarm-1', 'dose-alarm-2', 'dose-off-scale',
-        'connect-disconnect', 'unused9', # bit 8: sound for connect/disconnect (menu check); bit 9 unused
+        'connect-disconnect', 'power-on-off', # bits 8 and 9: sound for connect/disconnect and power on/off (menu checks)
         'count-rate-alarm-1',           # bit 10: vibration (menu check)
         'count-rate-alarm-2',           # bit 11: vibration on, sound turned on (menu check)
         'count-rate-off-scale',         # bit 12: vibration (menu check)
