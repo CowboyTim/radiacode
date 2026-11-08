@@ -221,12 +221,15 @@ BEGIN {
                    flags rt_flags duration dose temperature charge_level event event_name event_param1);
 
     # Per-event sound/vibration bits (SOUND_CTRL 0x0520, VIBRO_CTRL 0x0530). Bits 0-7 are
-    # cdump's CTRL enum. Bits 8-12 appear on firmware 4.15; only bit 10 is named so far.
+    # cdump's CTRL enum. Bits 8-12 appear on firmware 4.15; bits 10-12 are named from menu checks.
     @CTRL_NAME = (
         'buttons', 'clicks', 'dose-rate-alarm-1', 'dose-rate-alarm-2', 'dose-rate-off-scale',
         'dose-alarm-1', 'dose-alarm-2', 'dose-off-scale',
-        'bit8', 'bit9', 'count-rate-alarm-1',     # bit 10 identified: vibration for count-rate alarm 1
-        map { "bit$_" } 11 .. 31,
+        'bit8', 'bit9',                 # sound only so far, not identified
+        'count-rate-alarm-1',           # bit 10: vibration (menu check)
+        'count-rate-alarm-2',           # bit 11: vibration on, sound turned on (menu check)
+        'count-rate-off-scale',         # bit 12: vibration (menu check)
+        map { "bit$_" } 13 .. 31,
     );
 
     # Device event ids (cdump EventId). Alarm events are DOSE_RATE_ALARM1/2 (9, 10),
