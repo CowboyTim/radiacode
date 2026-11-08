@@ -1143,8 +1143,8 @@ sub print_alarms {
 # Display, sound and language settings (read-only). Decoding follows cdump's setters:
 #   display off-time: raw 3 = 30 s, otherwise (raw + 1) * 5 s
 #   direction: 0 auto, 1 right, 2 left
-#   language: 0 = en on this device (observed: device shows English, register 0).
-#             cdump's set_language documents 1 = en, so confirm before relying on it.
+#   language: register 0 = English on this device (device shows English). cdump documents
+#             1 = en; the device can't be switched from here, so 0 = en is used as observed.
 sub read_settings {
     my ($self) = @_;
     my @ids = (0x0511, 0x0512, 0x0513, 0x0515, 0x0516,   # BRT, CONTR, OFF_TIME, DIR, BACKLT_ON
