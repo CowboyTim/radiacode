@@ -45,6 +45,7 @@ my %opts = (
     interval          => 2,
     count             => 0,
     dir               => undef,
+    allow_power_off   => 0,
     spectrum_every    => 0,
     format            => 'text',
     output            => undef,
@@ -79,6 +80,7 @@ GetOptions(
     'set-time:s'        => \$set_time,
     'spectrum-reset'    => \$do_spectrum_reset,
     'set=s@'            => \@set_args,
+    'allow-power-off'   => \$opts{allow_power_off},
     'monitor'           => \$do_monitor,
     'plot:s'            => \$plot_dir,
     'dir=s'             => \$opts{dir},
@@ -266,6 +268,7 @@ sub new {
         format          => $o{format} // 'text',
         output          => $o{output},
         backfill        => $o{backfill} // 0,
+        allow_power_off => $o{allow_power_off} // 0,
 
         socket          => undef,
         out             => \*STDOUT,
@@ -731,6 +734,16 @@ sub encode_setting {
     if ($name eq 'backlight') { return (0x0516, $onoff->($value)) }
     if ($name eq 'sound')     { return (0x0522, $onoff->($value)) }
     if ($name eq 'vibration') { return (0x0531, $onoff->($value)) }
+    if ($name eq 'device-on') {
+        # DEVICE_ON 0x0503. Turning the device off powers it down: it then needs its own
+        # button to wake, and BLE is unavailable until then.
+        my $v = lc($value // '');
+        return (0x0503, 1) if $v eq 'on';
+        die "turning the device off needs --allow-power-off\n"
+            unless $ctx->{allow_power_off};
+        return (0x0503, 0) if $v eq 'off';
+        die "must be on or off\n";
+    }
     if ($name eq 'alarm-mode') {
         my %m = (continuous => 0, once => 1);
         die "must be continuous or once\n" unless exists $m{lc($value // '')};
@@ -801,6 +814,7 @@ sub set_setting {
         cr_cpm => (defined $units[0] && $units[0]) ? 1 : 0,
         ds_sv  => (defined $units[1] && $units[1]) ? 1 : 0,
     };
+    $ctx->{allow_power_off} = $self->{allow_power_off};
     my ($id, $raw) = eval { encode_setting($name, $value, $ctx) };
     unless (defined $id) {
         my $err = $@ || "invalid value\n";
@@ -1910,6 +1924,8 @@ Actions (default: live readings):
                   alarm-count-1|2 (count unit), alarm-dose-rate-1|2 and alarm-dose-1|2
                   (uSv or uR, following the device units). Count alarms take cps or cpm.
                   alarm-mode (continuous|once) how the alarm signal repeats.
+                  device-on (on|off). "off" powers the device down (wake with its button);
+                  it is refused unless --allow-power-off is also given.
                   sound-EVENT / vibration-EVENT (on|off) per alarm event, e.g.
                   vibration-dose-rate-off-scale=off (see --settings for the names).
   --spectrum-reset  Clear the device's current spectrum (writes to the device).
