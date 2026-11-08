@@ -45,7 +45,6 @@ my %opts = (
     interval          => 2,
     count             => 0,
     dir               => undef,
-    allow_power_off   => 0,
     spectrum_every    => 0,
     format            => 'text',
     output            => undef,
@@ -57,6 +56,7 @@ my ($do_info, $do_config, $do_buffer, $do_status, $do_spectrum, $do_accum,
 my $do_monitor = 0;
 my $plot_dir;   # undef = not requested; '' = use --dir (or ./radiacode-data)
 my $do_spectrum_reset = 0;
+my $do_poweroff = 0;
 my @set_args;   # --set NAME=VALUE, repeatable
 my $set_time;   # undef = not requested; '' or 'now' = host clock; or 'YYYY-MM-DD HH:MM:SS'
 
@@ -80,7 +80,7 @@ GetOptions(
     'set-time:s'        => \$set_time,
     'spectrum-reset'    => \$do_spectrum_reset,
     'set=s@'            => \@set_args,
-    'allow-power-off'   => \$opts{allow_power_off},
+    'poweroff'          => \$do_poweroff,
     'monitor'           => \$do_monitor,
     'plot:s'            => \$plot_dir,
     'dir=s'             => \$opts{dir},
@@ -134,6 +134,7 @@ exit $rc_dev->run(
     settings => $do_settings,
     set_time => $set_time,
     spectrum_reset => $do_spectrum_reset,
+    poweroff       => $do_poweroff,
     set            => \@set_args,
     config   => $do_config,
     buffer   => $do_buffer,
@@ -268,7 +269,6 @@ sub new {
         format          => $o{format} // 'text',
         output          => $o{output},
         backfill        => $o{backfill} // 0,
-        allow_power_off => $o{allow_power_off} // 0,
 
         socket          => undef,
         out             => \*STDOUT,
@@ -326,6 +326,9 @@ sub run {
             }
             $rc = 1 unless $self->set_setting($name, $value);
         }
+        if ($todo{poweroff}) {
+            $rc |= $self->print_poweroff();
+        }
         if ($todo{spectrum_reset}) {
             $rc |= $self->print_spectrum_reset();
         }
@@ -352,7 +355,7 @@ sub run {
         }
         if (!$todo{info} && !$todo{status} && !$todo{config} && !$todo{buffer} && !$todo{spectrum}
             && !$todo{alarms} && !$todo{settings} && !defined $todo{set_time}
-            && !$todo{spectrum_reset} && !@{ $todo{set} || [] }) {
+            && !$todo{spectrum_reset} && !$todo{poweroff} && !@{ $todo{set} || [] }) {
             $rc |= $self->live($todo{interval}, $todo{count});
         }
         1;
@@ -734,16 +737,6 @@ sub encode_setting {
     if ($name eq 'backlight') { return (0x0516, $onoff->($value)) }
     if ($name eq 'sound')     { return (0x0522, $onoff->($value)) }
     if ($name eq 'vibration') { return (0x0531, $onoff->($value)) }
-    if ($name eq 'device-on') {
-        # DEVICE_ON 0x0503. Turning the device off powers it down: it then needs its own
-        # button to wake, and BLE is unavailable until then.
-        my $v = lc($value // '');
-        return (0x0503, 1) if $v eq 'on';
-        die "turning the device off needs --allow-power-off\n"
-            unless $ctx->{allow_power_off};
-        return (0x0503, 0) if $v eq 'off';
-        die "must be on or off\n";
-    }
     if ($name eq 'alarm-mode') {
         my %m = (continuous => 0, once => 1);
         die "must be continuous or once\n" unless exists $m{lc($value // '')};
@@ -814,7 +807,6 @@ sub set_setting {
         cr_cpm => (defined $units[0] && $units[0]) ? 1 : 0,
         ds_sv  => (defined $units[1] && $units[1]) ? 1 : 0,
     };
-    $ctx->{allow_power_off} = $self->{allow_power_off};
     my ($id, $raw) = eval { encode_setting($name, $value, $ctx) };
     unless (defined $id) {
         my $err = $@ || "invalid value\n";
@@ -832,6 +824,24 @@ sub set_setting {
     printf "%-20s raw %s -> %s (device reads %s) %s\n", "$name:",
         $old // 'n/a', $raw, $new // 'n/a', $ok ? 'OK' : 'MISMATCH';
     return $ok ? 1 : 0;
+}
+
+# Power the device down (DEVICE_ON = 0). It then needs its own button to wake, and BLE is
+# unavailable until then. Reads back the register before reporting.
+sub print_poweroff {
+    my ($self) = @_;
+    my ($old) = $self->read_vsfrs_raw(0x0503);
+    unless ($self->write_vsfr(0x0503, pack('V', 0))) {
+        print STDERR "ERROR: the device rejected the power-off\n";
+        return 1;
+    }
+    my ($new) = $self->read_vsfrs_raw(0x0503);
+    if (defined $new && $new == 0) {
+        print "Device powered off (was " . ($old ? 'on' : 'off') . "). Press its button to wake it.\n";
+        return 0;
+    }
+    print STDERR "ERROR: device still reads on after the power-off\n";
+    return 1;
 }
 
 # Clear the device's current (cumulative) spectrum. Command 0x0827 (WR_VIRT_STRING) with
@@ -1924,10 +1934,10 @@ Actions (default: live readings):
                   alarm-count-1|2 (count unit), alarm-dose-rate-1|2 and alarm-dose-1|2
                   (uSv or uR, following the device units). Count alarms take cps or cpm.
                   alarm-mode (continuous|once) how the alarm signal repeats.
-                  device-on (on|off). "off" powers the device down (wake with its button);
-                  it is refused unless --allow-power-off is also given.
+
                   sound-EVENT / vibration-EVENT (on|off) per alarm event, e.g.
                   vibration-dose-rate-off-scale=off (see --settings for the names).
+  --poweroff      Power the device down (needs its button to wake). Writes to the device.
   --spectrum-reset  Clear the device's current spectrum (writes to the device).
                   The monitor handles this itself: it logs the reset and rebases.
   --set-time [T]  Write the device clock: 'now' (default) or 'YYYY-MM-DD HH:MM:SS'
