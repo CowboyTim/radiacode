@@ -724,13 +724,18 @@ sub encode_setting {
         return (0x0513, $v == 30 ? 3 : $v / 5 - 1);     # inverse of the read side
     }
     if ($name eq 'direction') {
-        my %d = (auto => 0, right => 1, left => 2);
-        die "must be auto, right or left\n" unless exists $d{lc($value // '')};
+        my %d = (auto => 0, normal => 1, right => 1, left => 2);
+        die "must be auto, normal or left\n" unless exists $d{lc($value // '')};
         return (0x0515, $d{lc $value});
     }
     if ($name eq 'backlight') { return (0x0516, $onoff->($value)) }
     if ($name eq 'sound')     { return (0x0522, $onoff->($value)) }
     if ($name eq 'vibration') { return (0x0531, $onoff->($value)) }
+    if ($name eq 'alarm-mode') {
+        my %m = (continuous => 0, once => 1);
+        die "must be continuous or once\n" unless exists $m{lc($value // '')};
+        return (0x05E0, $m{lc $value});
+    }
 
     if ($name =~ /^alarm-(count|dose-rate|dose)-([12])$/) {
         my ($kind, $lvl) = ($1, $2);
@@ -1192,10 +1197,11 @@ sub read_settings {
     my ($self) = @_;
     my @ids = (0x0511, 0x0512, 0x0513, 0x0515, 0x0516,   # BRT, CONTR, OFF_TIME, DIR, BACKLT_ON
                0x0521, 0x0522, 0x0531, 0x0502,           # SOUND_VOL, SOUND_ON, VIBRO_ON, LANG
-               0x0520, 0x0530);                          # SOUND_CTRL, VIBRO_CTRL (per event)
+               0x0520, 0x0530,                           # SOUND_CTRL, VIBRO_CTRL (per event)
+               0x05E0);                                  # ALARM_MODE (0 continuous, 1 once)
     my @r = $self->read_vsfrs_raw(@ids);
     return unless @r;
-    my ($brt, $contr, $off, $dir, $bl, $vol, $snd, $vib, $lang, $sctl, $vctl) = @r;
+    my ($brt, $contr, $off, $dir, $bl, $vol, $snd, $vib, $lang, $sctl, $vctl, $amode) = @r;
     my %s;
     $s{brightness}   = $brt   if defined $brt;
     $s{contrast}     = $contr if defined $contr;
@@ -1203,13 +1209,17 @@ sub read_settings {
         $s{display_off_s} = $off == 3 ? 30 : ($off + 1) * 5;
     }
     if (defined $dir) {
-        $s{direction} = { 0 => 'auto', 1 => 'right', 2 => 'left' }->{$dir} // "unknown($dir)";
+        # 1 is the device's "normal" orientation (cdump calls it right); 2 is left.
+        $s{direction} = { 0 => 'auto', 1 => 'normal', 2 => 'left' }->{$dir} // "unknown($dir)";
     }
     $s{backlight_on} = $bl ? 1 : 0 if defined $bl;
     $s{sound_volume} = $vol if defined $vol;
     $s{sound_on}     = $snd ? 1 : 0 if defined $snd;
     $s{vibro_on}     = $vib ? 1 : 0 if defined $vib;
     $s{language}     = defined $lang ? ($lang ? 'ru' : 'en') : undef;   # observed mapping, see above
+    if (defined $amode) {
+        $s{alarm_mode} = { 0 => 'continuous', 1 => 'once' }->{$amode} // "unknown($amode)";
+    }
     if (defined $sctl) {
         $s{sound_events}     = { map { $CTRL_NAME[$_] => (($sctl >> $_) & 1) ? 1 : 0 } 0 .. $#CTRL_NAME };
     }
@@ -1240,6 +1250,7 @@ sub print_settings {
         [sound_volume    => 'Sound volume',    sub { $_[0] }],
         [vibro_on        => 'Vibration',       sub { $_[0] ? 'on' : 'off' }],
         [language        => 'Language',        sub { $_[0] }],
+        [alarm_mode      => 'Alarm signal',    sub { $_[0] }],
     );
     for my $k (qw(sound_events vibration_events)) {
         next unless $s->{$k};
@@ -1895,9 +1906,10 @@ Actions (default: live readings):
   --accum         With --spectrum: read the accumulated spectrum instead
   --set NAME=VALUE  Write a device setting, read it back and report (writes to the device;
                   repeatable). Names: brightness (0-9), display-off (5, 10, 15 or 30 s),
-                  direction (auto|right|left), backlight, sound, vibration (on|off),
+                  direction (auto|normal|left), backlight, sound, vibration (on|off),
                   alarm-count-1|2 (count unit), alarm-dose-rate-1|2 and alarm-dose-1|2
                   (uSv or uR, following the device units). Count alarms take cps or cpm.
+                  alarm-mode (continuous|once) how the alarm signal repeats.
                   sound-EVENT / vibration-EVENT (on|off) per alarm event, e.g.
                   vibration-dose-rate-off-scale=off (see --settings for the names).
   --spectrum-reset  Clear the device's current spectrum (writes to the device).

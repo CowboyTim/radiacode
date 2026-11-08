@@ -18,6 +18,7 @@ ok(!eval { $enc->('display-off', 20); 1 }, '20 s refused: shares raw 3 with 30 s
 is_deeply([ $enc->('display-off', 30) ], [0x0513, 3], 'display-off 30 s -> raw 3');
 ok(!eval { $enc->('display-off', 12); 1 }, 'display-off 12 s refused');
 is_deeply([ $enc->('direction', 'LEFT') ], [0x0515, 2], 'direction is case-insensitive');
+is_deeply([ $enc->('direction', 'normal') ], [0x0515, 1], 'direction normal is raw 1');
 is_deeply([ $enc->('backlight', 'on') ], [0x0516, 1], 'backlight on');
 is_deeply([ $enc->('sound', 'off') ], [0x0522, 0], 'sound off');
 is_deeply([ $enc->('vibration', 'on') ], [0x0531, 1], 'vibration on');
@@ -39,5 +40,9 @@ ok(!eval { $enc->('alarm-dose-1', -1, $sv); 1 }, 'negative refused');
 
 ok(!eval { $enc->('no-such-setting', 1); 1 }, 'unknown name refused');
 like($@, qr/unknown setting/, 'clear message');
+
+is_deeply([ $enc->('alarm-mode', 'once') ], [0x05E0, 1], 'alarm mode once');
+is_deeply([ $enc->('alarm-mode', 'continuous') ], [0x05E0, 0], 'alarm mode continuous');
+ok(!eval { $enc->('alarm-mode', 'sometimes'); 1 }, 'alarm mode refused for other values');
 
 done_testing;
