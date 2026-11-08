@@ -48,6 +48,7 @@ my %opts = (
 
 my ($do_info, $do_config, $do_buffer, $do_status, $do_spectrum, $do_accum,
     $do_alarms, $do_settings) = (0) x 8;
+my $set_time;   # undef = not requested; '' or 'now' = host clock; or 'YYYY-MM-DD HH:MM:SS'
 
 GetOptions(
     'device|d=s'        => \$opts{device},
@@ -66,6 +67,7 @@ GetOptions(
     'accum'             => \$do_accum,
     'alarms'            => \$do_alarms,
     'settings'          => \$do_settings,
+    'set-time:s'        => \$set_time,
     'config'            => \$do_config,
     'buffer'            => \$do_buffer,
     'debug|v+'          => \$opts{debug},
@@ -102,6 +104,7 @@ exit $rc_dev->run(
     accum    => $do_accum,
     alarms   => $do_alarms,
     settings => $do_settings,
+    set_time => $set_time,
     config   => $do_config,
     buffer   => $do_buffer,
     count    => $opts{count},
@@ -254,6 +257,9 @@ sub run {
         }
 
         $rc = 0;
+        if (defined $todo{set_time}) {
+            $rc |= $self->print_set_time($todo{set_time});
+        }
         if ($todo{info}) {
             $rc |= $self->print_info();
         }
@@ -276,7 +282,7 @@ sub run {
             $rc |= $self->print_buffer();
         }
         if (!$todo{info} && !$todo{status} && !$todo{config} && !$todo{buffer} && !$todo{spectrum}
-            && !$todo{alarms} && !$todo{settings}) {
+            && !$todo{alarms} && !$todo{settings} && !defined $todo{set_time}) {
             $rc |= $self->live($todo{interval}, $todo{count});
         }
         1;
@@ -578,6 +584,40 @@ sub read_vsfrs_raw {
     return @res;
 }
 
+# Send a clock value to the device. The device takes local date/time fields (no zone),
+# so the fields come from localtime($epoch). Also resets the device time counter to 0,
+# as cdump does after SET_TIME. Returns true on success.
+sub send_clock {
+    my ($self, $epoch) = @_;
+    my @t = localtime($epoch);
+    my $tm = pack('C8', $t[3], $t[4] + 1, ($t[5] + 1900) - 2000, 0, $t[0], $t[1], $t[2], 0);
+    defined $self->execute(CMD_SET_TIME, $tm) or return 0;
+    return $self->write_vsfr(VSFR_DEVICE_TIME, pack('V', 0)) ? 1 : 0;
+}
+
+# --set-time: write a clock value to the device. Value 'now' (or empty) uses the host
+# clock; otherwise 'YYYY-MM-DD HH:MM:SS' is taken as the device's local time.
+sub print_set_time {
+    my ($self, $value) = @_;
+    my $epoch;
+    if (!defined $value || $value eq '' || $value eq 'now') {
+        $epoch = time();
+    } elsif ($value =~ /^(\d{4})-(\d\d)-(\d\d)[ T](\d\d):(\d\d):(\d\d)$/) {
+        $epoch = POSIX::mktime($6, $5, $4, $3, $2 - 1, $1 - 1900);
+    }
+    unless (defined $epoch) {
+        print STDERR "ERROR: --set-time expects 'now' or 'YYYY-MM-DD HH:MM:SS'\n";
+        return 1;
+    }
+    unless ($self->send_clock($epoch)) {
+        print STDERR "ERROR: could not set device time\n";
+        return 1;
+    }
+    print "Device time set to ", strftime('%Y-%m-%d %H:%M:%S', localtime($epoch)),
+          " (local fields sent as-is)\n";
+    return 0;
+}
+
 # Handshake, time sync and base time (mirrors cdump/radiacode RadiaCode.__init__).
 sub init_device {
     my ($self) = @_;
@@ -585,11 +625,7 @@ sub init_device {
     # execute() returns '' (not undef) for a valid empty body, so test definedness.
     defined $self->execute(CMD_SET_EXCHANGE, "\x01\xff\x12\xff") or return 0;
 
-    my @t = localtime(time());
-    my $tm = pack('C8', $t[3], $t[4] + 1, ($t[5] + 1900) - 2000, 0, $t[0], $t[1], $t[2], 0);
-    defined $self->execute(CMD_SET_TIME, $tm) or return 0;
-
-    $self->write_vsfr(VSFR_DEVICE_TIME, pack('V', 0)) or return 0;
+    $self->send_clock(time()) or return 0;
     $self->{base_time} = time() + 128;
     $self->{start_time} = time();
 
@@ -917,7 +953,8 @@ sub print_alarms {
 # Display, sound and language settings (read-only). Decoding follows cdump's setters:
 #   display off-time: raw 3 = 30 s, otherwise (raw + 1) * 5 s
 #   direction: 0 auto, 1 right, 2 left
-#   language: 1 = en, 0 = ru (cdump set_language)
+#   language: 0 = en on this device (observed: device shows English, register 0).
+#             cdump's set_language documents 1 = en, so confirm before relying on it.
 sub read_settings {
     my ($self) = @_;
     my @ids = (0x0511, 0x0512, 0x0513, 0x0515, 0x0516,   # BRT, CONTR, OFF_TIME, DIR, BACKLT_ON
@@ -938,7 +975,7 @@ sub read_settings {
     $s{sound_volume} = $vol if defined $vol;
     $s{sound_on}     = $snd ? 1 : 0 if defined $snd;
     $s{vibro_on}     = $vib ? 1 : 0 if defined $vib;
-    $s{language}     = defined $lang ? ($lang ? 'en' : 'ru') : undef;
+    $s{language}     = defined $lang ? ($lang ? 'ru' : 'en') : undef;   # observed mapping, see above
     return \%s;
 }
 
@@ -1023,7 +1060,11 @@ sub read_status {
             # i.e. uSv/h = raw * 1e4 (matches the 10000x factor in cdump's webserver example).
             $s{rt_dose_uSv_h} = $rt->{dose_rate} * 1e4;
         }
-        if (my $rare = $newest->('rare')) {
+        # Rare records carry the device's measurement-duration counter, which only grows.
+        # Timestamps can't be compared across sessions (the device counter resets at connect),
+        # so the largest duration is the most recent record.
+        my ($rare) = sort { $b->{duration} <=> $a->{duration} } grep { $_->{type} eq 'rare' } @recs;
+        if ($rare) {
             $s{charge_level}    = $rare->{charge_level};
             $s{rare_temp_c}     = $rare->{temperature};
             $s{rare_duration_s} = $rare->{duration};
@@ -1216,6 +1257,8 @@ Actions (default: live readings):
   --status        Show device status registers (count rate, dose rate, temp, battery)
   --spectrum      Read the current energy spectrum (summary; CSV/JSON give all channels)
   --accum         With --spectrum: read the accumulated spectrum instead
+  --set-time [T]  Write the device clock: 'now' (default) or 'YYYY-MM-DD HH:MM:SS'
+                  (local time, sent as-is). Writes to the device.
   --alarms        Show count-rate, dose-rate and dose alarm thresholds (read-only)
   --settings      Show display, sound, vibration and language settings (read-only)
   --config        Dump device configuration (text)
