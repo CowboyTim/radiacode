@@ -15,7 +15,7 @@ subtest 'one set of dated files per day, each with a header' => sub {
     close $_ for values %$fh;
     ok(-f "$dir/rates-2026-11-08.csv", 'rates file named by date');
     ok(-f "$dir/events-2026-11-08.csv", 'events file named by date');
-    ok(-f "$dir/spectrum-2026-11-08.csv", 'spectrum file named by date');
+    ok(-f "$dir/spectrogram-2026-11-08.csv", 'spectrogram file named by date');
     open(my $in, '<', "$dir/rates-2026-11-08.csv") or die;
     my $first = <$in>;
     is($first, "time,cps,cpm,cps_err_pct,dose_rate_uSv_h,dose_rate_raw,flags\n", 'header first');

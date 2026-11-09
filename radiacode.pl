@@ -1592,7 +1592,7 @@ sub format_record {
 my %MONITOR_HEADER = (
     rates    => "time,cps,cpm,cps_err_pct,dose_rate_uSv_h,dose_rate_raw,flags\n",
     events   => "time,event_id,event_name,param1,flags\n",
-    spectrum => "time,channel,energy_keV,counts\n",
+    spectrogram => "time,a0,a1,a2," . join(',', map { "ch$_" } 0 .. 1023) . "\n",
 );
 
 # Append-mode file with a header written only when the file is new or empty.
@@ -1606,14 +1606,14 @@ sub _open_log {
 }
 
 # Open the log files for one local day: rates-DATE.csv, events-DATE.csv and, when
-# spectrum logging is on, spectrum-DATE.csv. Returns a hashref of filehandles.
+# spectrum logging is on, spectrogram-DATE.csv. Returns a hashref of filehandles.
 sub _open_day {
     my ($dir, $day, $spec_on) = @_;
     my %fh = (
         rates  => _open_log("$dir/rates-$day.csv",  $MONITOR_HEADER{rates}),
         events => _open_log("$dir/events-$day.csv", $MONITOR_HEADER{events}),
     );
-    $fh{spectrum} = _open_log("$dir/spectrum-$day.csv", $MONITOR_HEADER{spectrum}) if $spec_on;
+    $fh{spectrum} = _open_log("$dir/spectrogram-$day.csv", $MONITOR_HEADER{spectrogram}) if $spec_on;
     return \%fh;
 }
 
@@ -1751,11 +1751,8 @@ sub spectrum_delta {
 
     my $now = iso_time(time());
     my ($a0, $a1, $a2) = @{$s}{qw(a0 a1 a2)};
-    for my $i (0 .. $#c) {
-        my $d = $c[$i] - $prev->{counts}[$i];
-        next unless $d > 0;
-        printf {$fh} "%s,%d,%.3f,%d\n", $now, $i, channel_to_keV($i, $a0, $a1, $a2), $d;
-    }
+    my @delta = map { $c[$_] - $prev->{counts}[$_] } 0 .. $#c;
+    printf {$fh} "%s,%.9g,%.9g,%.9g,%s\n", $now, $a0, $a1, $a2, join(',', @delta);
 }
 
 sub debug {
@@ -1803,6 +1800,24 @@ sub read_csv {
     }
     close $fh;
     return \@rows;
+}
+
+# The spectrogram has one row per time slice with 1024 channel columns. Turn it into one row
+# per non-zero channel, which is what plot_spectrum() works from.
+sub spectrogram_rows {
+    my ($dir) = @_;
+    my @out;
+    for my $r (@{ read_logs($dir, 'spectrogram') }) {
+        my ($a0, $a1, $a2) = @{$r}{qw(a0 a1 a2)};
+        next unless defined $a0 && defined $a1 && defined $a2;
+        for my $ch (0 .. 1023) {
+            my $c = $r->{"ch$ch"} // 0;
+            next unless $c > 0;
+            push @out, { time => $r->{time}, channel => $ch,
+                         energy_keV => $a0 + $a1 * $ch + $a2 * $ch * $ch, counts => $c };
+        }
+    }
+    return \@out;
 }
 
 # All daily files of one kind, in date order: rates-*.csv (or a single rates.csv).
@@ -1980,7 +1995,7 @@ sub run {
     die "no such directory: $dir\n" unless -d $dir;
     my $rates  = read_logs($dir, 'rates');
     my $events = read_logs($dir, 'events');
-    my $spec   = read_logs($dir, 'spectrum');
+    my $spec   = spectrogram_rows($dir);
     plot_rates($rates, $events, "$dir/rates.svg");
     plot_spectrum($spec, "$dir/spectrum.svg");
     return 0;
@@ -2023,7 +2038,8 @@ Actions (default: live readings):
                   (local time, sent as-is). Writes to the device.
   --monitor       Long-running logger. Each local day gets new files: rates-DATE.csv,
                   events-DATE.csv (alarms and other device events) and, with
-                  --spectrum-every, spectrum-DATE.csv (per-interval counts).
+                  --spectrum-every, spectrogram-DATE.csv: one row per interval with
+                  the counts added in each of the 1024 channels.
                   Reconnects after link loss; Ctrl-C stops it.
   --dir DIR       Output directory for --monitor (default: ./radiacode-data)
   --plot [DIR]    Draw DIR/rates.svg and DIR/spectrum.svg from the --monitor logs.

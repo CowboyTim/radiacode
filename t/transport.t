@@ -74,10 +74,16 @@ subtest 'empty body is defined (not failure)' => sub {
 };
 
 subtest 'spectrum_delta: baseline, per-interval change, reset' => sub {
+    # Full-length (1024 channel) spectra, as the device sends them.
+    my $blob = sub {
+        my ($dur, @head) = @_;
+        my @c = (@head, (0) x (1024 - @head));
+        return pack('V f< f< f<', $dur, 0, 1, 0) . pack('V*', @c);
+    };
     my @blobs = (
-        pack('V f< f< f<', 100, 0, 1, 0) . pack('V*', 5, 0, 10),   # baseline
-        pack('V f< f< f<', 110, 0, 1, 0) . pack('V*', 7, 0, 10),   # +2 on channel 0
-        pack('V f< f< f<', 5,   0, 1, 0) . pack('V*', 1, 0, 0),    # reset (duration and counts drop)
+        $blob->(100, 5, 0, 10),   # baseline
+        $blob->(110, 7, 0, 10),   # +2 on channel 0
+        $blob->(5,   1, 0, 0),    # reset: duration and counts drop
     );
     my $cfg = "SpecFormatVersion=0\n";
     my $n = 0;
@@ -100,8 +106,11 @@ subtest 'spectrum_delta: baseline, per-interval change, reset' => sub {
         },
     );
     my @rows = grep { length } split /\n/, $text;
-    is(scalar @rows, 1, 'only the changed channel is written');
-    like($rows[0], qr/,0,0\.000,2$/, 'channel 0, energy and +2 counts');
+    is(scalar @rows, 1, 'one dense row for the interval');
+    my @f = split /,/, $rows[0];
+    is(scalar @f, 4 + 1024, 'time, a0, a1, a2 and 1024 channels');
+    is($f[4], 2, 'channel 0 gained 2 counts');
+    is(scalar(grep { $_ != 0 } @f[5 .. $#f]), 0, 'other channels unchanged (zero delta)');
 };
 
 done_testing;

@@ -17,10 +17,10 @@ open(my $e, '>', "$dir/events.csv") or die;
 print {$e} "time,event_id,event_name,param1,flags\n";
 print {$e} "2026-11-08T18:00:30.000+0000,20,COUNT_RATE_ALARM1,0,0\n";
 close $e;
-open(my $s, '>', "$dir/spectrum.csv") or die;
-print {$s} "time,channel,energy_keV,counts\n";
-print {$s} "2026-11-08T18:00:10.000+0000,3,12.4,2\n";
-print {$s} "2026-11-08T18:00:20.000+0000,5,20.1,7\n";
+open(my $s, '>', "$dir/spectrogram-2026-11-08.csv") or die;
+print {$s} "time,a0,a1,a2," . join(',', map { "ch$_" } 0 .. 1023) . "\n";
+my @row = (0) x 1024; $row[3] = 2; $row[5] = 7;
+print {$s} join(',', "2026-11-08T18:00:10.000+0000", 5.349152, 2.3553936, 3.4938657e-4, @row) . "\n";
 close $s;
 
 is(RadiaCode::Plot::run($dir), 0, 'plot returns 0');
