@@ -570,8 +570,9 @@ sub ceil_int  { my $v = shift; my $i = int($v); return $i < $v ? $i + 1 : $i }
 sub floor_int { my $v = shift; my $i = int($v); return $i > $v ? $i - 1 : $i }
 
 # Text (terminal) version of the spectrum plot: the same log histogram by channel, drawn with
-# eighth-height block characters. Each column takes the largest channel in its span, so
-# narrow peaks stay visible. Matched lines are marked under the axis.
+# Braille characters. A Braille character is a 2x4 grid of dots, so each character carries
+# two thin bars (one per dot column) and four dot rows of height. Each bar takes the largest
+# channel in its span, so narrow peaks stay visible. Matched lines are marked under the axis.
 sub render_text {
     my ($reg, $net, $emax, $marks, $width, $height) = @_;
     my $cal = $reg->{calib};
@@ -587,15 +588,16 @@ sub render_text {
     my $lmin = $lmax - 4;
 
     my $label_w = 8;
-    my $pw = $width - $label_w;
+    my $pw = $width - $label_w;          # characters across
     $pw = 20 if $pw < 20;
-    my $levels = $height * 8;
-    my @blocks = (' ', "\x{2581}", "\x{2582}", "\x{2583}", "\x{2584}", "\x{2585}", "\x{2586}", "\x{2587}", "\x{2588}");
+    my $dw = 2 * $pw;                    # dot columns across (two bars per character)
+    my $dh = 4 * $height;                # dot rows down (four per character)
 
-    my @col_level;
-    for my $x (0 .. $pw - 1) {
-        my $c0 = int($x * ($cmax + 1) / $pw);
-        my $c1 = int(($x + 1) * ($cmax + 1) / $pw) - 1;
+    # height of each dot column, in dot rows from the bottom
+    my @level;
+    for my $x (0 .. $dw - 1) {
+        my $c0 = int($x * ($cmax + 1) / $dw);
+        my $c1 = int(($x + 1) * ($cmax + 1) / $dw) - 1;
         $c1 = $c0 if $c1 < $c0;
         my $m = 0;
         for my $c ($c0 .. $c1) { $m = $v[$c] if $v[$c] > $m }
@@ -604,28 +606,33 @@ sub render_text {
             my $f = (log($m) / log(10) - $lmin) / ($lmax - $lmin);
             $f = 0 if $f < 0;
             $f = 1 if $f > 1;
-            $lvl = int($f * $levels + 0.5);
+            $lvl = int($f * $dh + 0.5);
         }
-        push @col_level, $lvl;
+        push @level, $lvl;
     }
 
+    # Braille bit for dot (column, row) in a character: rows top to bottom
+    my @bit = ([0, 1, 2, 6], [3, 4, 5, 7]);
+
     binmode(STDOUT, ':encoding(UTF-8)');
-    my $decade_row = sub { my $k = shift; return int(($lmax - $k) / ($lmax - $lmin) * $height + 0.5) };
     print "\nSpectrum (net counts/s, log scale; channel across, keV from calibration below):\n";
     for my $r (0 .. $height - 1) {
         my $label = ' ' x $label_w;
         for (my $k = int($lmin) + 1; $k <= int($lmax); $k++) {
-            if ($decade_row->($k) == $r) {
-                $label = sprintf('%7g ', 10 ** $k);
-            }
+            my $dec_row = int(($lmax - $k) / ($lmax - $lmin) * $height + 0.5);
+            $label = sprintf('%7g ', 10 ** $k) if $dec_row == $r;
         }
-        my $line = $label . '';
-        my $base = ($height - 1 - $r) * 8;
-        for my $x (0 .. $pw - 1) {
-            my $cell = $col_level[$x] - $base;
-            $cell = 0 if $cell < 0;
-            $cell = 8 if $cell > 8;
-            $line .= $blocks[$cell];
+        my $line = $label;
+        for my $i (0 .. $pw - 1) {
+            my $bits = 0;
+            for my $s (0 .. 1) {
+                my $x = 2 * $i + $s;
+                for my $t (0 .. 3) {
+                    my $from_bottom = $dh - 1 - ($r * 4 + $t);
+                    $bits |= 1 << $bit[$s][$t] if $level[$x] > $from_bottom;
+                }
+            }
+            $line .= $bits ? chr(0x2800 + $bits) : ' ';
         }
         print "$line\n";
     }
@@ -634,7 +641,6 @@ sub render_text {
     # matched-line marks under the axis
     my @mark_line = (' ') x $pw;
     my @legend;
-    my $i = 0;
     for my $m (@$marks) {
         my $c = channel_for_energy($m->{energy}, $cal);
         next unless defined $c && $c >= 0 && $c <= $cmax;
@@ -646,7 +652,6 @@ sub render_text {
     print ' ' x $label_w, join('', @mark_line), "\n" if @legend;
 
     # channel ticks
-    my $tick_line = ' ' x $label_w;
     my $step = $cmax <= 300 ? 25 : $cmax <= 700 ? 50 : 100;
     my @t = (' ') x $pw;
     for (my $c = 0; $c <= $cmax; $c += $step) {
@@ -654,7 +659,7 @@ sub render_text {
         my $s = sprintf('%d', $c);
         for my $j (0 .. length($s) - 1) { $t[$x + $j] = substr($s, $j, 1) if $x + $j < $pw }
     }
-    print $tick_line, join('', @t), "  (channel)\n";
+    print ' ' x $label_w, join('', @t), "  (channel)\n";
     print "  marks: ", join(' | ', @legend), "\n" if @legend;
     return;
 }
