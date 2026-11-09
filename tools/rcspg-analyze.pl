@@ -479,52 +479,95 @@ sub _esc {
     return $s;
 }
 
-# Spectrum plot (cps against keV) with the matched library lines drawn as dashed marks.
+# Channel for a device energy: inverse of keV = a0 + a1*ch + a2*ch^2 (rising branch).
+sub channel_for_energy {
+    my ($E, $cal) = @_;
+    my ($a0, $a1, $a2) = @$cal;
+    return ($E - $a0) / $a1 if abs($a2) < 1e-12;
+    my $disc = $a1 * $a1 - 4 * $a2 * ($a0 - $E);
+    return undef if $disc < 0;
+    return (-$a1 + sqrt($disc)) / (2 * $a2);
+}
+
+# Spectrum as a histogram: channel on the x axis, log10 counts/s on the y axis. Each channel
+# is a vertical line from the bottom of the plot up to its value. Matched library lines are
+# dashed marks at their channel, labelled with the energy.
 sub write_svg {
     my ($file, $reg, $net, $emax, $marks) = @_;
-    my ($W, $H, $L, $R, $T, $B) = (960, 420, 60, 20, 30, 50);
+    my ($W, $H, $L, $R, $T, $B) = (960, 420, 70, 20, 30, 56);
     my $pw = $W - $L - $R;
     my $ph = $H - $T - $B;
-    my @xy;
-    my $ymax = 0;
-    for my $c (0 .. NCH - 1) {
-        my $e = channel_energy($c, $reg->{calib});
-        next if $e < 0 || $e > $emax;
+    my $cal = $reg->{calib};
+
+    my $cmax = channel_for_energy($emax, $cal);
+    $cmax = NCH - 1 if !defined $cmax || $cmax > NCH - 1;
+    $cmax = int($cmax);
+
+    my @v;
+    my $vmax = 0;
+    for my $c (0 .. $cmax) {
         my $v = $net->[$c] / $reg->{seconds};
-        $ymax = $v if $v > $ymax;
-        push @xy, [ $e, $v ];
+        push @v, $v;
+        $vmax = $v if $v > $vmax;
     }
-    $ymax = 1 unless $ymax > 0;
-    $ymax *= 1.1;
-    my $x = sub { $L + $pw * $_[0] / $emax };
-    my $y = sub { $T + $ph * (1 - $_[0] / $ymax) };
+    $vmax = 1 unless $vmax > 0;
+    my $lmax = log($vmax) / log(10);
+    my $lmin = $lmax - 4;                      # four decades shown
+    my $x = sub { $L + $pw * ($_[0]) / ($cmax + 1) };
+    my $y = sub {
+        my $lv = log(max_of($_[0], 10 ** $lmin)) / log(10);
+        return $T + $ph * ($lmax - $lv) / ($lmax - $lmin);
+    };
 
     open(my $fh, '>', $file) or die "cannot write $file: $!\n";
     print {$fh} qq{<svg xmlns="http://www.w3.org/2000/svg" width="$W" height="$H" viewBox="0 0 $W $H" font-family="sans-serif" font-size="11">\n};
     print {$fh} qq{<rect width="100%" height="100%" fill="#ffffff"/>\n};
+
+    # decade grid and y labels
+    for (my $k = ceil_int($lmin); $k <= floor_int($lmax); $k++) {
+        my $yy = $T + $ph * ($lmax - $k) / ($lmax - $lmin);
+        printf {$fh} qq{<line x1="%.1f" y1="%.1f" x2="%.1f" y2="%.1f" stroke="#e3e3e3"/>\n}, $L, $yy, $L + $pw, $yy;
+        printf {$fh} qq{<text x="%.1f" y="%.1f" text-anchor="end" fill="#333">%g</text>\n}, $L - 6, $yy + 4, 10 ** $k;
+    }
+    printf {$fh} qq{<text x="14" y="%.1f" fill="#333" transform="rotate(-90 14 %.1f)" text-anchor="middle">net counts/s (log)</text>\n}, $T + $ph / 2, $T + $ph / 2;
+
+    # axes and channel ticks (with the energy of each tick below it)
     printf {$fh} qq{<line x1="%.1f" y1="%.1f" x2="%.1f" y2="%.1f" stroke="#333"/>\n}, $L, $T + $ph, $L + $pw, $T + $ph;
     printf {$fh} qq{<line x1="%.1f" y1="%.1f" x2="%.1f" y2="%.1f" stroke="#333"/>\n}, $L, $T, $L, $T + $ph;
-    my $step = $emax <= 150 ? 25 : $emax <= 400 ? 50 : 200;
-    for (my $e = 0; $e <= $emax; $e += $step) {
-        printf {$fh} qq{<line x1="%.1f" y1="%.1f" x2="%.1f" y2="%.1f" stroke="#ddd"/>\n}, $x->($e), $T, $x->($e), $T + $ph;
-        printf {$fh} qq{<text x="%.1f" y="%.1f" text-anchor="middle" fill="#333">%d</text>\n}, $x->($e), $T + $ph + 16, $e;
+    my $step = $cmax <= 300 ? 25 : $cmax <= 700 ? 50 : 100;
+    for (my $c = 0; $c <= $cmax; $c += $step) {
+        my $xx = $x->($c);
+        printf {$fh} qq{<text x="%.1f" y="%.1f" text-anchor="middle" fill="#333">%d</text>\n}, $xx, $T + $ph + 15, $c;
+        printf {$fh} qq{<text x="%.1f" y="%.1f" text-anchor="middle" fill="#999" font-size="9">%.0f keV</text>\n}, $xx, $T + $ph + 28, channel_energy($c, $cal);
     }
-    printf {$fh} qq{<text x="%.1f" y="%.1f" text-anchor="middle" fill="#333">energy (keV, device calibration)</text>\n}, $L + $pw / 2, $H - 10;
-    printf {$fh} qq{<text x="14" y="%.1f" fill="#333" transform="rotate(-90 14 %.1f)" text-anchor="middle">net counts/s</text>\n}, $T + $ph / 2, $T + $ph / 2;
-    my $pts = join ' ', map { sprintf('%.1f,%.1f', $x->($_->[0]), $y->($_->[1])) } @xy;
-    print {$fh} qq{<polyline points="$pts" fill="none" stroke="#1f5fa8" stroke-width="1.2"/>\n};
+    printf {$fh} qq{<text x="%.1f" y="%.1f" text-anchor="middle" fill="#333">channel (keV from the calibration, grey)</text>\n}, $L + $pw / 2, $H - 8;
+
+    # histogram: one vertical line per channel from the baseline to its value
+    my $d = '';
+    for my $c (0 .. $cmax) {
+        next unless $v[$c] > 0;
+        my $xx = $x->($c + 0.5);
+        $d .= sprintf('M%.1f %.1fV%.1f', $xx, $T + $ph, $y->($v[$c]));
+    }
+    print {$fh} qq{<path d="$d" fill="none" stroke="#1f5fa8" stroke-width="1"/>\n} if length $d;
 
     my @colors = ('#d1495b', '#2a9d8f', '#e9a03b', '#6a4c93', '#3c8d2f');
     my $row = 0;
     for my $m (@$marks) {
+        my $c = channel_for_energy($m->{energy}, $cal);
+        next unless defined $c && $c >= 0 && $c <= $cmax;
         my $col = $colors[ $m->{series} % @colors ];
-        my $lx = $x->($m->{energy});
+        my $lx = $x->($c + 0.5);
         printf {$fh} qq{<line x1="%.1f" y1="%.1f" x2="%.1f" y2="%.1f" stroke="%s" stroke-dasharray="5,3"/>\n}, $lx, $T, $lx, $T + $ph, $col;
-        printf {$fh} qq{<text x="%.1f" y="%.1f" fill="%s">%s %.1f</text>\n}, $lx + 3, $T + 12 + 12 * ($row++ % 6), $col, _esc($m->{label}), $m->{energy};
+        printf {$fh} qq{<text x="%.1f" y="%.1f" fill="%s">%s %.1f keV</text>\n}, $lx + 3, $T + 12 + 12 * ($row++ % 6), $col, _esc($m->{label}), $m->{energy};
     }
     print {$fh} "</svg>\n";
     close $fh or die "cannot write $file: $!\n";
 }
+
+sub max_of { my ($a, $b) = @_; return $a > $b ? $a : $b }
+sub ceil_int  { my $v = shift; my $i = int($v); return $i < $v ? $i + 1 : $i }
+sub floor_int { my $v = shift; my $i = int($v); return $i > $v ? $i - 1 : $i }
 
 sub usage {
     my ($code) = @_;
