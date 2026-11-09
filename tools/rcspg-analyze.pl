@@ -614,6 +614,15 @@ sub render_text {
     # Braille bit for dot (column, row) in a character: rows top to bottom
     my @bit = ([0, 1, 2, 6], [3, 4, 5, 7]);
 
+    # Lines, not bars: a dot at the top of each bar, joined to the neighbour bar by a
+    # vertical run where the height changes.
+    my $on = sub {
+        my ($x, $fb) = @_;
+        my $prev = $x > 0 ? $level[$x - 1] : $level[$x];
+        my $lo = ($level[$x] < $prev ? $level[$x] : $prev) - 1;
+        my $hi = ($level[$x] > $prev ? $level[$x] : $prev) - 1;
+        return $fb >= $lo && $fb <= $hi;
+    };
     binmode(STDOUT, ':encoding(UTF-8)');
     print "\nSpectrum (net counts/s, log scale; channel across, keV from calibration below):\n";
     for my $r (0 .. $height - 1) {
@@ -629,7 +638,7 @@ sub render_text {
                 my $x = 2 * $i + $s;
                 for my $t (0 .. 3) {
                     my $from_bottom = $dh - 1 - ($r * 4 + $t);
-                    $bits |= 1 << $bit[$s][$t] if $level[$x] > $from_bottom;
+                    $bits |= 1 << $bit[$s][$t] if $on->($x, $from_bottom);
                 }
             }
             $line .= $bits ? chr(0x2800 + $bits) : ' ';
