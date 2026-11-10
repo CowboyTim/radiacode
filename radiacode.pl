@@ -92,8 +92,9 @@ GetOptions(
     'config'            => \$do_config,
     'buffer'            => \$do_buffer,
     'debug|v+'          => \$opts{debug},
-    'help|h'            => sub { print_usage(); exit 0; },
-) or do { print_usage(); exit 1; };
+    'man'               => sub { show_man() },
+    'help|h'            => sub { show_manual() },
+) or usage_error();
 
 # --plot needs no device: it only reads the CSV logs from --monitor.
 if (defined $plot_dir) {
@@ -108,7 +109,7 @@ if (defined $plot_dir) {
 
 unless ($opts{device}) {
     print STDERR "Error: -d / --device is required\n";
-    print_usage();
+    usage_error();
     exit 1;
 }
 unless ($opts{device} =~ /^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$/) {
@@ -2020,76 +2021,333 @@ sub run {
 
 package main;
 
-sub print_usage {
-    print <<"EOF";
-Usage: $0 -d AA:BB:CC:DD:EE:FF [actions] [options]
+# The POD below is the only manual. --help shows all of it as plain text; --man formats
+# the same POD as a man page (pod2man, shown with man(1)). A bad command line shows only
+# the SYNOPSIS and exits 1.
+sub show_manual {
+    require Pod::Usage;
+    # -noperldoc: render the POD here, so it works without the perl-doc package (perldoc
+    # would otherwise print the raw script when it is missing).
+    Pod::Usage::pod2usage(-verbose => 2, -exitval => 0, -noperldoc => 1);
+}
 
-Actions (default: live readings):
-  --info          Show serial number and firmware version
-  --status        Show device status registers (count rate, dose rate, temp, battery)
-  --spectrum      Read the current energy spectrum (summary; CSV/JSON give all channels)
-  --accum         With --spectrum: read the accumulated spectrum instead
-  --set NAME=VALUE  Write a device setting, read it back and report (writes to the device;
-                  repeatable). Names: brightness (0-9), display-off (5, 10, 15 or 30 s),
-                  direction (auto|normal|rotated), backlight, sound, vibration (on|off),
-                  alarm-count-1|2 (count unit), alarm-dose-rate-1|2 and alarm-dose-1|2
-                  (uSv or uR, following the device units). Count alarms take cps or cpm.
-                  alarm-mode (continuous|once) how the alarm signal repeats.
+# --man: pod2man the POD and show it with man(1). Falls back to show_manual() when no
+# working man(1) is found (a man that exits 0 without rendering a page is not trusted).
+sub show_man {
+    require Pod::Man;
+    require File::Temp;
+    my $roff = '';
+    my $pm = Pod::Man->new(section => 1, center => 'RadiaCode tools', release => 'radiacode.pl',
+                           name => 'RADIACODE');
+    $pm->output_string(\$roff);
+    $pm->parse_file($0);
 
-                  sound-EVENT / vibration-EVENT (on|off) per alarm event, e.g.
-                  vibration-dose-rate-off-scale=off (see --settings for the names).
-  --energy-calib  Read the energy calibration (a0, a1, a2) used for keV labels.
-  --set-energy-calib A0,A1,A2
-                  Write the energy calibration and read it back. Changes only the keV
-                  labels of the spectrum, not counts or dose.
-  --poweroff      Power the device down (needs its button to wake). Writes to the device.
-  --spectrum-reset  Clear the device's current spectrum (writes to the device).
-                  The monitor handles this itself: it logs the reset and rebases.
-  --set-time [T]  Write the device clock: 'now' (default) or 'YYYY-MM-DD HH:MM:SS'
-                  (local time, sent as-is). Writes to the device.
-  --monitor       Long-running logger. Each local day gets new files: rates-DATE.csv,
-                  events-DATE.csv (alarms and other device events) and, with
-                  --spectrum-every, spectrogram-DATE.csv: one row per interval with
-                  the counts added in each of the 1024 channels.
-                  Reconnects after link loss; Ctrl-C stops it.
-  --dir DIR       Output directory for --monitor (default: ./radiacode-data)
-  --plot [DIR]    Draw DIR/rates.svg and DIR/spectrum.svg from the --monitor logs.
-                  No device needed. DIR defaults to --dir, then ./radiacode-data.
-  --spectrum-every SEC
-                  With --monitor: read the spectrum every SEC seconds and log the change
-  --alarms        Show count-rate, dose-rate and dose alarm thresholds (read-only)
-  --settings      Show display, sound, vibration and language settings (read-only)
-  --config        Dump device configuration (text)
-  --buffer        Dump all buffered records once
-  (none)          Poll buffered records and emit new ones; Ctrl-C to stop
+    my (undef, $file) = File::Temp::tempfile(SUFFIX => '.1', UNLINK => 1);
+    open my $fh, '>', $file or return show_manual();
+    print {$fh} $roff;
+    close $fh;
 
-Output (records from --buffer and live mode):
-  -f, --format FMT         text|csv|json (default: text)
-  -o, --output FILE        Append output to FILE instead of STDOUT
-                           (CSV header is written only when FILE is empty/new)
-  --backfill               Live mode: also emit records already in the device buffer
-                           at start (default: only records that arrive after start)
+    return show_manual() unless grep { -x "$_/man" } split /:/, ($ENV{PATH} // '');
 
-Options:
-  -d, --device ADDR        BLE address of the RadiaCode (required)
-  -i, --interval SEC       Poll interval for live mode (default: 2)
-  -n, --count N            Stop live mode after N records (default: forever)
-  --addr-type TYPE         public|random (default: public)
-  --connect-timeout SEC    Connect timeout in seconds (default: 5)
-  --write-uuid UUID        Write characteristic (default: e63215e6-7003-49d8-96b0-b024798fb901)
-  --notify-uuid UUID       Notify characteristic (default: e63215e7-7003-49d8-96b0-b024798fb901)
-  -v, --debug              Verbose protocol trace (repeat for more)
-  -h, --help               Show this help
+    # Check that man renders the page (look for the NAME heading) before using it.
+    my $text = '';
+    if (open my $man, '-|', 'man', '-l', $file) {
+        local $/;
+        $text = <$man> // '';
+        close $man;
+    }
+    return show_manual() unless $text =~ /^NAME\s*$/m;
 
-Examples:
-  $0 -d 52:43:06:E0:0C:23 --info
-  $0 -d 52:43:06:E0:0C:23 --status
-  $0 -d 52:43:06:E0:0C:23 -i 1 -n 20
-  $0 -d 52:43:06:E0:0C:23 -i 5 --format csv -o readings.csv
-  $0 -d 52:43:06:E0:0C:23 --format json --buffer
-EOF
+    if (-t STDOUT) {
+        # Interactive: let man page through the terminal.
+        system('man', '-l', $file);
+    } else {
+        print $text;
+    }
+    exit 0;
+}
+
+sub usage_error {
+    require Pod::Usage;
+    Pod::Usage::pod2usage(-verbose => 0, -exitval => 1, -output => \*STDERR);
 }
 
 # Run the CLI only when executed as a script, not when required (e.g. by t/).
 run_cli() unless caller;
 1;
+
+__END__
+
+=head1 NAME
+
+radiacode.pl - read and log data from a RadiaCode radiation detector over Bluetooth LE
+
+=head1 SYNOPSIS
+
+  radiacode.pl -d AA:BB:CC:DD:EE:FF [action] [options]
+  radiacode.pl --plot [DIR]
+  radiacode.pl --man
+
+ Options:
+   -d, --device ADDR    BLE address of the device (required)
+   -f, --format FMT     text, csv or json
+   -o, --output FILE    append output to FILE
+   -i, --interval SEC   live-mode poll interval
+   -n, --count N        stop after N records
+   --status, --spectrum, --monitor, --buffer, ...  actions (see ACTIONS)
+   -h, --help           show this manual
+   --man                show this manual
+
+=head1 DESCRIPTION
+
+B<radiacode.pl> talks to a RadiaCode radiation detector (RC-10x family) directly over
+Bluetooth Low Energy, without the vendor app. It reads live count and dose rates, the
+device status, the energy spectrum, the device configuration and settings, and the
+records the device keeps in its buffer. It can also write settings back to the device,
+and it can run as a long-running logger that writes CSV files per day.
+
+The device must not be connected to another host (for example the phone app) at the
+same time as this script.
+
+The script needs Linux with BlueZ, because it opens L2CAP sockets directly. It uses
+only core Perl modules, so there is nothing to install from CPAN.
+
+Without an action, the script polls the device's buffered records and prints new ones
+until you press Ctrl-C.
+
+=head1 ACTIONS
+
+With no action, live mode polls the device's buffered records and prints new ones.
+
+=over 4
+
+=item B<--info>
+
+Show the serial number and firmware version.
+
+=item B<--status>
+
+Show the status registers: count rate (cps and cpm), dose rate (uSv/h), device
+temperature, whether the device is on, status flags, the charge level, the last charge
+start or stop event, and the accumulated dose. The charge level comes from the device's
+"rare" records. If the buffer has none, the output says so instead of leaving the line out.
+
+=item B<--spectrum>
+
+Read the current energy spectrum. The summary lists the calibration in use. With
+C<--format csv> or C<--format json> all 1024 channels are written, with the energy of
+each channel.
+
+=item B<--accum>
+
+With C<--spectrum>, read the accumulated spectrum instead of the current one.
+
+=item B<--spectrum-reset>
+
+Clear the device's current spectrum. This writes to the device.
+
+=item B<--energy-calib>
+
+Read the energy calibration (a0, a1, a2) used for the keV labels of the spectrum.
+
+=item B<--set-energy-calib> I<A0,A1,A2>
+
+Write the energy calibration and read it back. This changes only the keV labels, not the
+counts or the dose. It writes to the device.
+
+=item B<--set> I<NAME=VALUE>
+
+Write a device setting, read it back, and report it. This option can be repeated. It
+writes to the device. The names are:
+
+=over 4
+
+=item brightness (0-9)
+
+=item display-off (5, 10, 15 or 30 seconds)
+
+=item direction (auto, normal or rotated)
+
+=item backlight, sound, vibration (on or off)
+
+=item alarm-count-1 and alarm-count-2 (count unit; count alarms take cps or cpm)
+
+=item alarm-dose-rate-1 and alarm-dose-rate-2, alarm-dose-1 and alarm-dose-2 (uSv or uR,
+following the device units)
+
+=item alarm-mode (continuous or once)
+
+=item sound-EVENT and vibration-EVENT (on or off), per alarm event, for example
+C<vibration-dose-rate-off-scale=off>. Run C<--settings> to see the event names.
+
+=back
+
+=item B<--set-time> [I<T>]
+
+Write the device clock. Use C<now> (the default) for the host clock, or
+C<YYYY-MM-DD HH:MM:SS> in local time, which is sent as given. This writes to the device.
+
+=item B<--alarms>
+
+Show the count-rate, dose-rate and dose alarm thresholds. Read-only.
+
+=item B<--settings>
+
+Show the display, sound, vibration and language settings. Read-only.
+
+=item B<--config>
+
+Dump the device configuration as text.
+
+=item B<--buffer>
+
+Dump all records in the device buffer once, then exit.
+
+=item B<--monitor>
+
+Run as a long-running logger. Each local day gets its own files in the output directory:
+C<rates-DATE.csv> for the rates, C<events-DATE.csv> for alarms and other device events,
+and, with C<--spectrum-every>, C<spectrogram-DATE.csv>, which has one row per interval
+with the counts added in each of the 1024 channels. The logger reconnects after a link
+loss. Ctrl-C stops it. A spectrum reset is handled by the logger itself: it records the
+reset and starts a new baseline.
+
+=item B<--plot> [I<DIR>]
+
+Draw C<DIR/rates.svg> and C<DIR/spectrum.svg> from the C<--monitor> logs. This needs no
+device. I<DIR> defaults to C<--dir>, then C<./radiacode-data>.
+
+=item B<--poweroff>
+
+Power the device down. It can be woken with its button. This writes to the device.
+
+=item B<--man>
+
+Show this manual as a man page: the POD is formatted with C<pod2man> and shown with
+C<man(1)>, paged in a terminal. If no working C<man> is found, it prints the same text
+as C<--help>. It needs no device.
+
+=item B<-h>, B<--help>
+
+Show this manual as plain text, with all sections. It needs no device.
+
+=back
+
+=head1 OUTPUT OPTIONS
+
+=over 4
+
+=item B<-f>, B<--format> I<FMT>
+
+C<text>, C<csv> or C<json>. The default is C<text>.
+
+=item B<-o>, B<--output> I<FILE>
+
+Append the output to I<FILE> instead of printing it. A CSV header is written only when
+the file is empty or new.
+
+=item B<--backfill>
+
+In live mode, also output the records that were already in the device buffer at start.
+By default only the records that arrive after start are output.
+
+=back
+
+=head1 OPTIONS
+
+=over 4
+
+=item B<-d>, B<--device> I<ADDR>
+
+The Bluetooth address of the device. Required for every action except C<--plot> and C<--man>.
+
+=item B<-i>, B<--interval> I<SEC>
+
+Poll interval for live mode, in seconds. The default is 2.
+
+=item B<-n>, B<--count> I<N>
+
+Stop live mode after I<N> records. The default is to run until Ctrl-C.
+
+=item B<--addr-type> I<TYPE>
+
+C<public> or C<random>. The default is C<public>.
+
+=item B<--connect-timeout> I<SEC>
+
+Connect timeout in seconds. The default is 5.
+
+=item B<--write-uuid> I<UUID>, B<--notify-uuid> I<UUID>
+
+The GATT characteristics used for writing and for notifications. The defaults are the
+ones the RadiaCode uses; you normally do not need to change them.
+
+=item B<--dir> I<DIR>
+
+Output directory for C<--monitor> and C<--plot>. The default is C<./radiacode-data>.
+
+=item B<--spectrum-every> I<SEC>
+
+With C<--monitor>, read the spectrum every I<SEC> seconds and log the change.
+
+=item B<-v>, B<--debug>
+
+Verbose protocol trace. Repeat for more detail.
+
+=back
+
+=head1 EXAMPLES
+
+  # serial number and firmware
+  radiacode.pl -d 52:43:06:E0:0C:23 --info
+
+  # status, including the charge level if the buffer has it
+  radiacode.pl -d 52:43:06:E0:0C:23 --status
+
+  # ten readings, one every second, as CSV
+  radiacode.pl -d 52:43:06:E0:0C:23 -i 1 -n 10 --format csv
+
+  # save the current spectrum with all channels
+  radiacode.pl -d 52:43:06:E0:0C:23 --spectrum --format csv \
+      -o radiacode-data/spectrum-$(date +%Y%m%d-%H%M).csv
+
+  # log to daily files, with a spectrogram every 5 minutes
+  radiacode.pl -d 52:43:06:E0:0C:23 --monitor --spectrum-every 300
+
+  # draw the SVG charts from the monitor logs (no device needed)
+  radiacode.pl --plot
+
+=head1 FILES
+
+=over 4
+
+=item F<radiacode-data/>
+
+The default output directory for C<--monitor> and C<--plot>.
+
+=back
+
+=head1 NOTES
+
+=over 4
+
+=item *
+
+Spectrum energies come from the device's calibration (a0 + a1*ch + a2*ch^2). The last
+channel (1023) is an overflow bin for events above the full scale, so its counts are not
+real energies. Do not fit a calibration to it.
+
+=item *
+
+The device's charge level is only in its "rare" buffer records, which are written every
+few minutes. Realtime records carry a flags field, but it is not decoded to a charging
+state.
+
+=back
+
+=head1 SEE ALSO
+
+The protocol was worked out from the cdump project's RadiaCode code:
+L<https://github.com/cdump/radiacode>.
+
+=cut
