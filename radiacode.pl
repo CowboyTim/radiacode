@@ -2323,7 +2323,7 @@ Verbose protocol trace. Repeat for more detail.
 
 =item F<radiacode-data/>
 
-The default output directory for C<--monitor> and C<--plot>. It is ignored by git.
+The default output directory for C<--monitor> and C<--plot>.
 
 =back
 
