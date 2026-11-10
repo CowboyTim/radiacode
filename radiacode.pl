@@ -2347,8 +2347,6 @@ state.
 
 =head1 SEE ALSO
 
-L<perlrun>, L<man(1)>
-
 The protocol was worked out from the cdump project's RadiaCode code:
 L<https://github.com/cdump/radiacode>.
 
