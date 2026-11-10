@@ -1421,6 +1421,13 @@ sub read_status {
             # Accumulated dose: raw * 1e4 = uSv (matches the device display: 0.0270 raw -> 270 uSv).
             $s{dose_uSv}        = $rare->{dose} * 1e4;
         }
+        # The newest charge start/stop event shows whether the device was charging, even
+        # when the buffer has no rare record (and so no charge level).
+        my ($chg) = sort { $b->{time} <=> $a->{time} }
+                    grep { $_->{type} eq 'event' && $_->{event_name} =~ /^CHARGE_(START|STOP)$/ } @recs;
+        if ($chg) {
+            $s{last_charge_event} = "$chg->{event_name} at " . iso_time($chg->{time});
+        }
     }
     return \%s;
 }
@@ -1449,6 +1456,7 @@ sub print_status {
         [ds_uR         => 'Accumulated dose',  sub { "$_[0] uR" }],
         [temp_c        => 'Temperature',       sub { sprintf '%.1f C', $_[0] }],
         [charge_level  => 'Charge level',      sub { sprintf '%.1f %%', $_[0] }],
+        [last_charge_event => 'Last charge event', sub { $_[0] }],
         [device_on     => 'Device on',         sub { $_[0] ? 'yes' : 'no' }],
         [status_flags  => 'Status flags',      sub { sprintf '0x%08X', $_[0] }],
         [rare_duration_s => 'Measure time',    sub { "$_[0] s" }],
@@ -1461,6 +1469,9 @@ sub print_status {
         next unless exists $s->{$k};
         printf "%-20s %s\n", "$name:", $fmt->($s->{$k});
     }
+    # Charge level is only in rare records; say so instead of silently omitting it.
+    printf "%-20s %s\n", 'Charge level:', 'not in device buffer (no reading yet)'
+        unless exists $s->{charge_level};
     return 0;
 }
 
