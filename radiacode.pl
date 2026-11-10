@@ -92,7 +92,7 @@ GetOptions(
     'config'            => \$do_config,
     'buffer'            => \$do_buffer,
     'debug|v+'          => \$opts{debug},
-    'man'               => sub { show_manual() },
+    'man'               => sub { show_man() },
     'help|h'            => sub { show_manual() },
 ) or usage_error();
 
@@ -2021,13 +2021,50 @@ sub run {
 
 package main;
 
-# The POD below is the only manual. --help and --man show all of it (through the pager
-# when stdout is a terminal). A bad command line shows only the SYNOPSIS and exits 1.
+# The POD below is the only manual. --help shows all of it as plain text; --man formats
+# the same POD as a man page (pod2man, shown with man(1)). A bad command line shows only
+# the SYNOPSIS and exits 1.
 sub show_manual {
     require Pod::Usage;
     # -noperldoc: render the POD here, so it works without the perl-doc package (perldoc
     # would otherwise print the raw script when it is missing).
     Pod::Usage::pod2usage(-verbose => 2, -exitval => 0, -noperldoc => 1);
+}
+
+# --man: pod2man the POD and show it with man(1). Falls back to show_manual() when no
+# working man(1) is found (a man that exits 0 without rendering a page is not trusted).
+sub show_man {
+    require Pod::Man;
+    require File::Temp;
+    my $roff = '';
+    my $pm = Pod::Man->new(section => 1, center => 'RadiaCode tools', release => 'radiacode.pl',
+                           name => 'RADIACODE');
+    $pm->output_string(\$roff);
+    $pm->parse_file($0);
+
+    my (undef, $file) = File::Temp::tempfile(SUFFIX => '.1', UNLINK => 1);
+    open my $fh, '>', $file or return show_manual();
+    print {$fh} $roff;
+    close $fh;
+
+    return show_manual() unless grep { -x "$_/man" } split /:/, ($ENV{PATH} // '');
+
+    # Check that man renders the page (look for the NAME heading) before using it.
+    my $text = '';
+    if (open my $man, '-|', 'man', '-l', $file) {
+        local $/;
+        $text = <$man> // '';
+        close $man;
+    }
+    return show_manual() unless $text =~ /^NAME\s*$/m;
+
+    if (-t STDOUT) {
+        # Interactive: let man page through the terminal.
+        system('man', '-l', $file);
+    } else {
+        print $text;
+    }
+    exit 0;
 }
 
 sub usage_error {
@@ -2186,11 +2223,13 @@ Power the device down. It can be woken with its button. This writes to the devic
 
 =item B<--man>
 
-Show this manual. It needs no device.
+Show this manual as a man page: the POD is formatted with C<pod2man> and shown with
+C<man(1)>, paged in a terminal. If no working C<man> is found, it prints the same text
+as C<--help>. It needs no device.
 
 =item B<-h>, B<--help>
 
-Show this manual. It needs no device. Same as C<--man>.
+Show this manual as plain text, with all sections. It needs no device.
 
 =back
 
