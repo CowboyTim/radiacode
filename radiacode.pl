@@ -58,7 +58,6 @@ my $plot_dir;   # undef = not requested; '' = use --dir (or ./radiacode-data)
 my $do_spectrum_reset = 0;
 my $do_poweroff = 0;
 my $do_energy_calib = 0;
-my $do_man = 0;
 my $set_energy_calib;   # 'a0,a1,a2' to write
 my @set_args;   # --set NAME=VALUE, repeatable
 my $set_time;   # undef = not requested; '' or 'now' = host clock; or 'YYYY-MM-DD HH:MM:SS'
@@ -93,15 +92,9 @@ GetOptions(
     'config'            => \$do_config,
     'buffer'            => \$do_buffer,
     'debug|v+'          => \$opts{debug},
-    'man'               => \$do_man,
-    'help|h'            => sub { print_usage(); exit 0; },
-) or do { print_usage(); exit 1; };
-
-# --man needs no device: it formats this script's POD.
-if ($do_man) {
-    show_man();
-    exit 0;
-}
+    'man'               => sub { show_manual() },
+    'help|h'            => sub { show_manual() },
+) or usage_error();
 
 # --plot needs no device: it only reads the CSV logs from --monitor.
 if (defined $plot_dir) {
@@ -116,7 +109,7 @@ if (defined $plot_dir) {
 
 unless ($opts{device}) {
     print STDERR "Error: -d / --device is required\n";
-    print_usage();
+    usage_error();
     exit 1;
 }
 unless ($opts{device} =~ /^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$/) {
@@ -2028,108 +2021,18 @@ sub run {
 
 package main;
 
-sub print_usage {
-    print <<"EOF";
-Usage: $0 -d AA:BB:CC:DD:EE:FF [actions] [options]
-
-Actions (default: live readings):
-  --info          Show serial number and firmware version
-  --status        Show device status registers (count rate, dose rate, temp, battery)
-  --spectrum      Read the current energy spectrum (summary; CSV/JSON give all channels)
-  --accum         With --spectrum: read the accumulated spectrum instead
-  --set NAME=VALUE  Write a device setting, read it back and report (writes to the device;
-                  repeatable). Names: brightness (0-9), display-off (5, 10, 15 or 30 s),
-                  direction (auto|normal|rotated), backlight, sound, vibration (on|off),
-                  alarm-count-1|2 (count unit), alarm-dose-rate-1|2 and alarm-dose-1|2
-                  (uSv or uR, following the device units). Count alarms take cps or cpm.
-                  alarm-mode (continuous|once) how the alarm signal repeats.
-
-                  sound-EVENT / vibration-EVENT (on|off) per alarm event, e.g.
-                  vibration-dose-rate-off-scale=off (see --settings for the names).
-  --energy-calib  Read the energy calibration (a0, a1, a2) used for keV labels.
-  --set-energy-calib A0,A1,A2
-                  Write the energy calibration and read it back. Changes only the keV
-                  labels of the spectrum, not counts or dose.
-  --poweroff      Power the device down (needs its button to wake). Writes to the device.
-  --spectrum-reset  Clear the device's current spectrum (writes to the device).
-                  The monitor handles this itself: it logs the reset and rebases.
-  --set-time [T]  Write the device clock: 'now' (default) or 'YYYY-MM-DD HH:MM:SS'
-                  (local time, sent as-is). Writes to the device.
-  --monitor       Long-running logger. Each local day gets new files: rates-DATE.csv,
-                  events-DATE.csv (alarms and other device events) and, with
-                  --spectrum-every, spectrogram-DATE.csv: one row per interval with
-                  the counts added in each of the 1024 channels.
-                  Reconnects after link loss; Ctrl-C stops it.
-  --dir DIR       Output directory for --monitor (default: ./radiacode-data)
-  --plot [DIR]    Draw DIR/rates.svg and DIR/spectrum.svg from the --monitor logs.
-                  No device needed. DIR defaults to --dir, then ./radiacode-data.
-  --spectrum-every SEC
-                  With --monitor: read the spectrum every SEC seconds and log the change
-  --alarms        Show count-rate, dose-rate and dose alarm thresholds (read-only)
-  --settings      Show display, sound, vibration and language settings (read-only)
-  --config        Dump device configuration (text)
-  --buffer        Dump all buffered records once
-  (none)          Poll buffered records and emit new ones; Ctrl-C to stop
-
-Output (records from --buffer and live mode):
-  -f, --format FMT         text|csv|json (default: text)
-  -o, --output FILE        Append output to FILE instead of STDOUT
-                           (CSV header is written only when FILE is empty/new)
-  --backfill               Live mode: also emit records already in the device buffer
-                           at start (default: only records that arrive after start)
-
-Options:
-  -d, --device ADDR        BLE address of the RadiaCode (required)
-  -i, --interval SEC       Poll interval for live mode (default: 2)
-  -n, --count N            Stop live mode after N records (default: forever)
-  --addr-type TYPE         public|random (default: public)
-  --connect-timeout SEC    Connect timeout in seconds (default: 5)
-  --write-uuid UUID        Write characteristic (default: e63215e6-7003-49d8-96b0-b024798fb901)
-  --notify-uuid UUID       Notify characteristic (default: e63215e7-7003-49d8-96b0-b024798fb901)
-  -v, --debug              Verbose protocol trace (repeat for more)
-  -h, --help               Show this help
-  --man                    Show the manual page (no device needed)
-
-Examples:
-  $0 -d 52:43:06:E0:0C:23 --info
-  $0 -d 52:43:06:E0:0C:23 --status
-  $0 -d 52:43:06:E0:0C:23 -i 1 -n 20
-  $0 -d 52:43:06:E0:0C:23 -i 5 --format csv -o readings.csv
-  $0 -d 52:43:06:E0:0C:23 --format json --buffer
-EOF
+# The POD below is the only manual. --help and --man show all of it (through the pager
+# when stdout is a terminal). A bad command line shows only the SYNOPSIS and exits 1.
+sub show_manual {
+    require Pod::Usage;
+    # -noperldoc: render the POD here, so it works without the perl-doc package (perldoc
+    # would otherwise print the raw script when it is missing).
+    Pod::Usage::pod2usage(-verbose => 2, -exitval => 0, -noperldoc => 1);
 }
 
-# Show the manual page: formatted with man(1) when it is installed, otherwise plain text.
-sub show_man {
-    require Pod::Man;
-    require Pod::Text;
-    require File::Temp;
-    my $roff = '';
-    my $pm = Pod::Man->new(section => 1, center => 'RadiaCode tools', release => 'radiacode.pl',
-                           name => 'RADIACODE.PL');
-    $pm->output_string(\$roff);
-    $pm->parse_file($0);
-
-    # Render with man(1) and check that it produced a real page: a broken or stub man
-    # can exit 0 with no page, so look for the NAME heading in the output.
-    if (grep { -x "$_/man" } split /:/, ($ENV{PATH} // '')) {
-        my (undef, $file) = File::Temp::tempfile(SUFFIX => '.1', UNLINK => 1);
-        if (open my $out, '>', $file) {
-            print {$out} $roff;
-            close $out;
-            my $text = '';
-            if (open my $man, '-|', 'man', '-l', $file) {
-                local $/;
-                $text = <$man> // '';
-                close $man;
-            }
-            if ($text =~ /^NAME\s*$/m) {
-                print $text;
-                return;
-            }
-        }
-    }
-    Pod::Text->new(width => 78)->parse_from_file($0);
+sub usage_error {
+    require Pod::Usage;
+    Pod::Usage::pod2usage(-verbose => 0, -exitval => 1, -output => \*STDERR);
 }
 
 # Run the CLI only when executed as a script, not when required (e.g. by t/).
@@ -2147,6 +2050,16 @@ radiacode.pl - read and log data from a RadiaCode radiation detector over Blueto
   radiacode.pl -d AA:BB:CC:DD:EE:FF [action] [options]
   radiacode.pl --plot [DIR]
   radiacode.pl --man
+
+ Options:
+   -d, --device ADDR    BLE address of the device (required)
+   -f, --format FMT     text, csv or json
+   -o, --output FILE    append output to FILE
+   -i, --interval SEC   live-mode poll interval
+   -n, --count N        stop after N records
+   --status, --spectrum, --monitor, --buffer, ...  actions (see ACTIONS)
+   -h, --help           show this manual
+   --man                show this manual
 
 =head1 DESCRIPTION
 
@@ -2273,12 +2186,11 @@ Power the device down. It can be woken with its button. This writes to the devic
 
 =item B<--man>
 
-Show this manual page. It needs no device. The page is formatted with C<man(1)> when it
-is installed, and is printed as plain text otherwise.
+Show this manual. It needs no device.
 
 =item B<-h>, B<--help>
 
-Show the short usage summary.
+Show this manual. It needs no device. Same as C<--man>.
 
 =back
 
